@@ -11,6 +11,9 @@ defmodule CopilotSdk.Client do
   alias CopilotSdk.{ClientOptions, JsonRpc, Session, WireFormat}
   alias CopilotSdk.Generated.ServerRpc
 
+  # Store the project root at compile time for sibling directory resolution.
+  @sdk_project_root Path.expand("../../..", __DIR__)
+
   @type client :: pid() | atom() | GenServer.name()
 
   @type t :: %__MODULE__{
@@ -665,6 +668,11 @@ defmodule CopilotSdk.Client do
     end)
   end
 
+  @doc false
+  def resolve_cli_path_for_test do
+    resolve_cli_path(%ClientOptions{})
+  end
+
   defp resolve_cli_path(options) do
     cond do
       options.cli_path != nil ->
@@ -673,9 +681,36 @@ defmodule CopilotSdk.Client do
       (env_path = System.get_env("COPILOT_CLI_PATH")) != nil ->
         env_path
 
+      (sibling_path = find_sibling_cli_path()) != nil ->
+        sibling_path
+
       true ->
         raise RuntimeError,
-              "Copilot CLI not found. Set cli_path option or COPILOT_CLI_PATH env var."
+              "Copilot CLI not found. Set cli_path option, COPILOT_CLI_PATH env var, " <>
+                "or run 'npm install' in the sibling nodejs directory."
+    end
+  end
+
+  defp find_sibling_cli_path do
+    walk_up_for_cli(@sdk_project_root, 5)
+  end
+
+  defp walk_up_for_cli(_dir, 0), do: nil
+
+  defp walk_up_for_cli(dir, depth) do
+    candidate =
+      Path.join([dir, "nodejs", "node_modules", "@github", "copilot", "index.js"])
+
+    if File.exists?(candidate) do
+      candidate
+    else
+      parent = Path.dirname(dir)
+
+      if parent == dir do
+        nil
+      else
+        walk_up_for_cli(parent, depth - 1)
+      end
     end
   end
 
@@ -731,7 +766,9 @@ defmodule CopilotSdk.Client do
   defp maybe_add_cd(opts, nil), do: opts
   defp maybe_add_cd(opts, cwd), do: [{:cd, to_charlist(cwd)} | opts]
 
-  defp parse_cli_url(url) do
+  @doc false
+  @spec parse_cli_url(String.t()) :: {String.t(), non_neg_integer()}
+  def parse_cli_url(url) do
     uri = URI.parse(url)
     host = uri.host || "127.0.0.1"
     port = uri.port || 3000

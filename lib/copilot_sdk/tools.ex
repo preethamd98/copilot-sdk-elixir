@@ -55,8 +55,15 @@ defmodule CopilotSdk.Tools do
       "description" => tool.description
     }
 
-    if tool.parameters do
-      Map.put(wire, "inputSchema" , tool.parameters)
+    wire =
+      if tool.parameters do
+        Map.put(wire, "inputSchema", tool.parameters)
+      else
+        wire
+      end
+
+    if tool.overrides_built_in_tool do
+      Map.put(wire, "overridesBuiltInTool", true)
     else
       wire
     end

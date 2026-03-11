@@ -44,8 +44,16 @@ mix deps.get
 cd copilot-sdk/nodejs && npm install
 ```
 
-The CLI binary is located at
-`nodejs/node_modules/@github/copilot/app.js`.
+### CLI Path Resolution
+
+The SDK automatically discovers the CLI binary using this precedence:
+
+1. **Explicit option** — `cli_path: "/path/to/cli"` passed to `Client.start_link/1`
+2. **Environment variable** — `COPILOT_CLI_PATH`
+3. **Auto-discovery** — walks up from the SDK directory looking for
+   `nodejs/node_modules/@github/copilot/index.js` (sibling directory layout)
+
+If none are found, a clear error is raised.
 
 ## Quick Start
 
@@ -56,11 +64,9 @@ Mix.install([{:copilot_sdk, path: "path/to/copilot_sdk"}])
 
 alias CopilotSdk.{Client, Session, PermissionHandler}
 
-# 1. Start the client (connects to CLI server)
-{:ok, client} = Client.start_link(
-  cli_path: "path/to/nodejs/node_modules/@github/copilot/app.js",
-  auto_start: false
-)
+# 1. Start the client
+#    CLI is auto-discovered, or set COPILOT_CLI_PATH, or pass cli_path:
+{:ok, client} = Client.start_link(auto_start: false)
 :ok = Client.start(client)
 
 # 2. Create a session
@@ -95,14 +101,12 @@ Client.stop(client)
 ### In an OTP application
 
 ```elixir
-# In your supervision tree or application code:
-{:ok, client} = CopilotSdk.Client.start_link(
-  cli_path: "/path/to/app.js",
-  auto_start: false
-)
+# CLI is auto-discovered from the sibling nodejs/ directory.
+# Or set COPILOT_CLI_PATH env var, or pass cli_path: explicitly.
+{:ok, client} = CopilotSdk.Client.start_link(auto_start: false)
 :ok = CopilotSdk.Client.start(client)
 
-# Create a session with tools
+# Create a session with a custom tool
 tool = CopilotSdk.Tools.define_tool(
   name: "get_time",
   description: "Get the current UTC time",
@@ -138,10 +142,16 @@ tool = CopilotSdk.Tools.define_tool(
 ## Running Tests
 
 ```bash
-# Unit tests (102 tests, no CLI required)
+# Unit tests (109 tests, no CLI required)
 mix test
 
-# Quality checks
+# E2E tests (requires a real CLI — 27 additional tests)
+mix test --include e2e
+
+# All tests
+mix test --include e2e
+
+# Quality checks (compile warnings, formatting, credo, dialyzer)
 mix quality
 ```
 
