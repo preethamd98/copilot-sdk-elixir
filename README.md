@@ -6,6 +6,12 @@
 > and should **not** be used in production applications. APIs may change without
 > notice.
 
+> 🤖 **Authored by GitHub Copilot CLI**
+>
+> This entire SDK — all source code, tests, and documentation — was authored by
+> [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli),
+> GitHub's AI-powered terminal assistant.
+
 An Elixir SDK for communicating with the GitHub Copilot CLI server via
 JSON-RPC 2.0 over stdio, built on OTP patterns (GenServer, GenStage,
 Supervisors).
@@ -141,5 +147,5 @@ mix quality
 
 ## License
 
-See the repository root for license information.
+This project is licensed under the [MIT License](LICENSE).
 
