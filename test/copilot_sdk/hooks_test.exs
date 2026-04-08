@@ -40,6 +40,23 @@ defmodule CopilotSdk.HooksTest do
     assert result == %{modified: true}
   end
 
+  test "returns nil for unknown hook types (forward compatibility)" do
+    hooks = %SessionHooks{
+      on_pre_tool_use: fn _input, _context -> %{modified: true} end
+    }
+
+    # Unknown hook types from newer CLI versions should be silently ignored
+    assert nil == SessionHooks.dispatch(hooks, "postToolUseFailure", %{}, %{})
+    assert nil == SessionHooks.dispatch(hooks, "futureHookType", %{"key" => "value"}, %{})
+  end
+
+  test "returns nil for unknown hook types when no hooks are registered" do
+    hooks = %SessionHooks{}
+
+    assert nil == SessionHooks.dispatch(hooks, "unknownHookType", %{}, %{})
+    assert nil == SessionHooks.dispatch(nil, "unknownHookType", %{}, %{})
+  end
+
   defp build_hooks_with(hook_type, handler) do
     field_map = %{
       "preToolUse" => :on_pre_tool_use,

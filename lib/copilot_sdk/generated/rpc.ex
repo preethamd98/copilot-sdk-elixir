@@ -50,6 +50,17 @@ defmodule CopilotSdk.Generated.ServerRpc do
       opts
     )
   end
+  @spec set_session_fs_provider(t(), CopilotSdk.SessionFsConfig.t(), keyword()) ::
+          {:ok, term()} | {:error, term()}
+  def set_session_fs_provider(rpc, config, opts \\ []) do
+    params = %{
+      "initialCwd" => config.initial_cwd,
+      "sessionStatePath" => config.session_state_path,
+      "conventions" => Atom.to_string(config.conventions)
+    }
+
+    CopilotSdk.JsonRpc.Client.request(rpc.json_rpc_pid, "sessionFs.setProvider", params, opts)
+  end
 end
 
 defmodule CopilotSdk.Generated.SessionRpc do

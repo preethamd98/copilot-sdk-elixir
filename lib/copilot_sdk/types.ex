@@ -230,6 +230,7 @@ defmodule CopilotSdk.SessionConfig do
           client_name: String.t() | nil,
           model: String.t() | nil,
           reasoning_effort: String.t() | nil,
+          model_capabilities: map() | nil,
           tools: [CopilotSdk.Tool.t()] | nil,
           system_message: map() | nil,
           available_tools: [String.t()] | nil,
@@ -244,10 +245,12 @@ defmodule CopilotSdk.SessionConfig do
           custom_agents: [map()] | nil,
           agent: String.t() | nil,
           config_dir: String.t() | nil,
+          enable_config_discovery: boolean() | nil,
           skill_directories: [String.t()] | nil,
           disabled_skills: [String.t()] | nil,
           infinite_sessions: map() | nil,
-          on_event: function() | nil
+          on_event: function() | nil,
+          create_session_fs_handler: (pid() -> map()) | nil
         }
 
   defstruct [
@@ -255,6 +258,7 @@ defmodule CopilotSdk.SessionConfig do
     :client_name,
     :model,
     :reasoning_effort,
+    :model_capabilities,
     :tools,
     :system_message,
     :available_tools,
@@ -269,11 +273,32 @@ defmodule CopilotSdk.SessionConfig do
     :custom_agents,
     :agent,
     :config_dir,
+    :enable_config_discovery,
     :skill_directories,
     :disabled_skills,
     :infinite_sessions,
-    :on_event
+    :on_event,
+    :create_session_fs_handler
   ]
+end
+
+defmodule CopilotSdk.SessionFsConfig do
+  @moduledoc """
+  Configuration for a custom session filesystem provider.
+
+  When set on `CopilotSdk.ClientOptions`, the SDK registers the client as the
+  filesystem provider for all sessions. Each session must also supply a
+  `create_session_fs_handler` in its config to handle the actual filesystem calls.
+  """
+
+  @type t :: %__MODULE__{
+          initial_cwd: String.t(),
+          session_state_path: String.t(),
+          conventions: :windows | :posix
+        }
+
+  @enforce_keys [:initial_cwd, :session_state_path, :conventions]
+  defstruct [:initial_cwd, :session_state_path, :conventions]
 end
 
 defmodule CopilotSdk.ClientOptions do
@@ -292,7 +317,8 @@ defmodule CopilotSdk.ClientOptions do
           env: %{String.t() => String.t()} | nil,
           github_token: String.t() | nil,
           use_logged_in_user: boolean() | nil,
-          on_list_models: function() | nil
+          on_list_models: function() | nil,
+          session_fs: CopilotSdk.SessionFsConfig.t() | nil
         }
 
   defstruct cli_path: nil,
@@ -307,7 +333,8 @@ defmodule CopilotSdk.ClientOptions do
             env: nil,
             github_token: nil,
             use_logged_in_user: nil,
-            on_list_models: nil
+            on_list_models: nil,
+            session_fs: nil
 
   @doc "Build a ClientOptions struct from a keyword list, validating constraints."
   @spec new(keyword()) :: t()

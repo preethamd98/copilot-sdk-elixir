@@ -177,4 +177,39 @@ defmodule CopilotSdk.WireFormatTest do
     assert payload["infiniteSessions"]["enabled"] == true
     assert payload["infiniteSessions"]["backgroundCompactionThreshold"] == 0.8
   end
+
+  test "session payload includes modelCapabilities when set" do
+    model_caps = %{
+      "supports" => %{"vision" => true, "reasoningEffort" => false},
+      "limits" => %{"max_context_window_tokens" => 128_000}
+    }
+
+    payload =
+      WireFormat.build_session_payload(
+        %{model_capabilities: model_caps},
+        "session-1"
+      )
+
+    assert payload["modelCapabilities"] == model_caps
+  end
+
+  test "session payload omits modelCapabilities when nil" do
+    payload = WireFormat.build_session_payload(%{}, "session-1")
+    refute Map.has_key?(payload, "modelCapabilities")
+  end
+
+  test "session payload includes enableConfigDiscovery when set" do
+    payload =
+      WireFormat.build_session_payload(
+        %{enable_config_discovery: true},
+        "session-1"
+      )
+
+    assert payload["enableConfigDiscovery"] == true
+  end
+
+  test "session payload omits enableConfigDiscovery when nil" do
+    payload = WireFormat.build_session_payload(%{}, "session-1")
+    refute Map.has_key?(payload, "enableConfigDiscovery")
+  end
 end
