@@ -25,7 +25,8 @@ defmodule CopilotSdk.Session do
           user_input_handler: function() | nil,
           hooks: CopilotSdk.SessionHooks.t() | nil,
           rpc: CopilotSdk.Generated.SessionRpc.t() | nil,
-          on_event: function() | nil
+          on_event: function() | nil,
+          session_fs_handler: map() | nil
         }
 
   defstruct [
@@ -40,7 +41,8 @@ defmodule CopilotSdk.Session do
     :user_input_handler,
     :hooks,
     :rpc,
-    :on_event
+    :on_event,
+    :session_fs_handler
   ]
 
   # --- Public API ---
@@ -151,6 +153,24 @@ defmodule CopilotSdk.Session do
     GenServer.call(session, :workspace_path)
   end
 
+  @doc "Set the session FS handler (called by Client after session creation when sessionFs is configured)."
+  @spec set_session_fs_handler(session(), map()) :: :ok
+  def set_session_fs_handler(session, handler) do
+    GenServer.cast(session, {:set_session_fs_handler, handler})
+  end
+
+  @doc "Invoke hook handlers by wire hook type name. Called by the Client's hooks.invoke request handler."
+  @spec invoke_hooks(session(), String.t(), term()) :: term()
+  def invoke_hooks(session, hook_type, input) do
+    GenServer.call(session, {:invoke_hooks, hook_type, input})
+  end
+
+  @doc "Get the session FS handler (used by Client to route sessionFs.* requests)."
+  @spec get_session_fs_handler(session()) :: map() | nil
+  def get_session_fs_handler(session) do
+    GenServer.call(session, :get_session_fs_handler)
+  end
+
   @doc "Set the workspace path (called by Client after session.create response)."
   @spec set_workspace_path(session(), String.t() | nil) :: :ok
   def set_workspace_path(session, path) do
@@ -209,7 +229,8 @@ defmodule CopilotSdk.Session do
       user_input_handler: config[:on_user_input_request] || config["on_user_input_request"],
       hooks: config[:hooks] || config["hooks"],
       rpc: session_rpc,
-      on_event: config[:on_event] || config["on_event"]
+      on_event: config[:on_event] || config["on_event"],
+      session_fs_handler: nil
     }
 
     # If there's an early-bind on_event handler, subscribe it immediately
@@ -285,6 +306,15 @@ defmodule CopilotSdk.Session do
     {:reply, state.rpc, state}
   end
 
+  def handle_call({:invoke_hooks, hook_type, input}, _from, state) do
+    result = CopilotSdk.SessionHooks.dispatch(state.hooks, hook_type, input, %{session_id: state.session_id})
+    {:reply, result, state}
+  end
+
+  def handle_call(:get_session_fs_handler, _from, state) do
+    {:reply, state.session_fs_handler, state}
+  end
+
   @impl true
   def handle_cast({:dispatch_event, event_data}, state) do
     event = SessionEvent.from_map(event_data)
@@ -300,6 +330,10 @@ defmodule CopilotSdk.Session do
 
   def handle_cast({:set_workspace_path, path}, state) do
     {:noreply, %{state | workspace_path: path}}
+  end
+
+  def handle_cast({:set_session_fs_handler, handler}, state) do
+    {:noreply, %{state | session_fs_handler: handler}}
   end
 
   @impl true

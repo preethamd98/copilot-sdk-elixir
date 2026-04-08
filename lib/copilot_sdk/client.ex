@@ -372,6 +372,50 @@ defmodule CopilotSdk.Client do
     {:reply, unsub, %{state | lifecycle_handlers: handlers}}
   end
 
+  def handle_call({:hooks_invoke, session_id, hook_type, input}, _from, state) do
+    result =
+      case Map.get(state.sessions, session_id) do
+        nil ->
+          nil
+
+        session_pid ->
+          Session.invoke_hooks(session_pid, hook_type, input)
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:session_fs_call, operation, params}, from, state) do
+    session_id = params["sessionId"]
+
+    case Map.get(state.sessions, session_id) do
+      nil ->
+        raise "Session not found: #{session_id}"
+
+      session_pid ->
+        handler = Session.get_session_fs_handler(session_pid)
+
+        if handler do
+          op_atom = fs_operation_atom(operation)
+          op_fn = Map.get(handler, op_atom)
+
+          if op_fn do
+            # Run the filesystem operation in a task to avoid blocking the client GenServer
+            Task.start(fn ->
+              result = op_fn.(params)
+              GenServer.reply(from, result)
+            end)
+
+            {:noreply, state}
+          else
+            raise "No handler for sessionFs.#{operation}"
+          end
+        else
+          raise "No sessionFs handler registered for session: #{session_id}"
+        end
+    end
+  end
+
   @impl true
   def handle_cast({:remove_lifecycle_handler, ref}, state) do
     handlers = Enum.reject(state.lifecycle_handlers, fn {r, _} -> r == ref end)
@@ -423,6 +467,8 @@ defmodule CopilotSdk.Client do
       # data directly (avoiding GenServer re-entrancy during verify_protocol_version)
       Port.connect(port, json_rpc)
 
+      setup_request_handlers(json_rpc, self())
+
       server_rpc = ServerRpc.new(json_rpc)
 
       new_state = %{
@@ -435,7 +481,16 @@ defmodule CopilotSdk.Client do
 
       case verify_protocol_version(new_state) do
         {:ok, version} ->
-          {:ok, %{new_state | state: :connected, negotiated_protocol_version: version}}
+          connected_state = %{new_state | state: :connected, negotiated_protocol_version: version}
+
+          case maybe_register_session_fs_provider(connected_state) do
+            {:ok, final_state} ->
+              {:ok, final_state}
+
+            {:error, reason} ->
+              do_force_stop(connected_state)
+              {:error, reason}
+          end
 
         {:error, reason} ->
           do_force_stop(new_state)
@@ -483,6 +538,8 @@ defmodule CopilotSdk.Client do
             notification_handler: notification_handler(self())
           )
 
+        setup_request_handlers(json_rpc, self())
+
         server_rpc = ServerRpc.new(json_rpc)
 
         new_state = %{
@@ -496,7 +553,16 @@ defmodule CopilotSdk.Client do
 
         case verify_protocol_version(new_state) do
           {:ok, version} ->
-            {:ok, %{new_state | state: :connected, negotiated_protocol_version: version}}
+            connected_state = %{new_state | state: :connected, negotiated_protocol_version: version}
+
+            case maybe_register_session_fs_provider(connected_state) do
+              {:ok, final_state} ->
+                {:ok, final_state}
+
+              {:error, reason} ->
+                do_force_stop(connected_state)
+                {:error, reason}
+            end
 
           {:error, reason} ->
             do_force_stop(new_state)
@@ -546,6 +612,8 @@ defmodule CopilotSdk.Client do
            %{session_id: session_id, json_rpc_pid: state.json_rpc, config: config}}
         )
 
+      maybe_set_session_fs_handler(session_pid, config, state.options)
+
       sessions = Map.put(state.sessions, session_id, session_pid)
       state = %{state | sessions: sessions}
 
@@ -576,6 +644,8 @@ defmodule CopilotSdk.Client do
           {Session,
            %{session_id: session_id, json_rpc_pid: state.json_rpc, config: config}}
         )
+
+      maybe_set_session_fs_handler(session_pid, config, state.options)
 
       sessions = Map.put(state.sessions, session_id, session_pid)
       state = %{state | sessions: sessions}
@@ -657,6 +727,77 @@ defmodule CopilotSdk.Client do
       send(client_pid, {:notification, method, params})
     end
   end
+
+  defp setup_request_handlers(json_rpc, client_pid) do
+    JsonRpc.Client.set_request_handler(json_rpc, "hooks.invoke", fn params ->
+      session_id = params["sessionId"]
+      hook_type = params["hookType"]
+      input = params["input"]
+
+      result =
+        GenServer.call(client_pid, {:hooks_invoke, session_id, hook_type, input})
+
+      %{"output" => result}
+    end)
+
+    fs_ops = [
+      "readFile",
+      "writeFile",
+      "appendFile",
+      "exists",
+      "stat",
+      "mkdir",
+      "readdir",
+      "readdirWithTypes",
+      "rm",
+      "rename"
+    ]
+
+    for op <- fs_ops do
+      JsonRpc.Client.set_request_handler(json_rpc, "sessionFs.#{op}", fn params ->
+        GenServer.call(client_pid, {:session_fs_call, op, params})
+      end)
+    end
+
+    :ok
+  end
+
+  defp maybe_register_session_fs_provider(state) do
+    case state.options.session_fs do
+      nil ->
+        {:ok, state}
+
+      config ->
+        case ServerRpc.set_session_fs_provider(state.server_rpc, config) do
+          {:ok, _} -> {:ok, state}
+          {:error, reason} -> {:error, {:session_fs_setup_failed, reason}}
+        end
+    end
+  end
+
+  defp maybe_set_session_fs_handler(session_pid, config, options) do
+    if options.session_fs do
+      factory = config[:create_session_fs_handler] || config["create_session_fs_handler"]
+
+      if factory do
+        handler = factory.(session_pid)
+        Session.set_session_fs_handler(session_pid, handler)
+      end
+    end
+  end
+
+  # Maps camelCase operation names to atom keys used in handler maps
+  defp fs_operation_atom("readFile"), do: :read_file
+  defp fs_operation_atom("writeFile"), do: :write_file
+  defp fs_operation_atom("appendFile"), do: :append_file
+  defp fs_operation_atom("exists"), do: :exists
+  defp fs_operation_atom("stat"), do: :stat
+  defp fs_operation_atom("mkdir"), do: :mkdir
+  defp fs_operation_atom("readdir"), do: :readdir
+  defp fs_operation_atom("readdirWithTypes"), do: :readdir_with_types
+  defp fs_operation_atom("rm"), do: :rm
+  defp fs_operation_atom("rename"), do: :rename
+  defp fs_operation_atom(op), do: String.to_atom(op)
 
   defp dispatch_lifecycle(state, event_type, data) do
     Enum.each(state.lifecycle_handlers, fn {_ref, handler} ->
