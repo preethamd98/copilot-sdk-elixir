@@ -62,6 +62,8 @@ defmodule CopilotSdk.Generated.ServerRpc do
     CopilotSdk.JsonRpc.Client.request(rpc.json_rpc_pid, "sessionFs.setProvider", params, opts)
   end
 end
+
+defmodule CopilotSdk.Generated.SessionRpc do
   @moduledoc "Session-scoped RPC methods. Auto-injects sessionId."
 
   @type t :: %__MODULE__{json_rpc_pid: pid(), session_id: String.t()}

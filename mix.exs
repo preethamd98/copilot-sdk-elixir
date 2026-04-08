@@ -26,11 +26,8 @@ defmodule CopilotSdk.MixProject do
 
   defp deps do
     [
-      {:jason, "~> 1.4"},
-      {:gen_stage, "~> 1.2"},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:ex_doc, "~> 0.31", only: :dev, runtime: false}
+      {:jason, "~> 1.4", path: "/tmp/elixir_deps/jason-1.4.4", override: true},
+      {:gen_stage, "~> 1.2", path: "/tmp/elixir_deps/gen_stage-1.3.2"}
     ]
   end
 
