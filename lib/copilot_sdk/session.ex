@@ -4,7 +4,7 @@ defmodule CopilotSdk.Session do
   and the send_and_wait coordination pattern.
   """
 
-  use GenServer
+  use GenServer, restart: :temporary
   require Logger
 
   alias CopilotSdk.{SessionEvent, ToolInvocation, ToolResult, PermissionRequestResult}
@@ -54,21 +54,15 @@ defmodule CopilotSdk.Session do
   @spec on(session(), (SessionEvent.t() -> any())) :: (-> :ok)
   def on(session, handler_fn) when is_function(handler_fn, 1) do
     {:ok, consumer_pid} = GenServer.call(session, {:subscribe, handler_fn})
-    monitor_ref = Process.monitor(consumer_pid)
 
     fn ->
-      if Process.alive?(consumer_pid) do
-        GenStage.stop(consumer_pid, :normal)
-
-        # Wait for the process to actually terminate
-        receive do
-          {:DOWN, ^monitor_ref, :process, ^consumer_pid, _} -> :ok
-        after
-          1000 -> :ok
-        end
-      else
-        Process.demonitor(monitor_ref, [:flush])
+      try do
+        if Process.alive?(consumer_pid), do: GenStage.stop(consumer_pid, :normal)
+      catch
+        :exit, _ -> :ok
       end
+
+      :ok
     end
   end
 
@@ -79,9 +73,16 @@ defmodule CopilotSdk.Session do
   end
 
   @doc "Send a message to this session."
-  @spec send_message(session(), map() | keyword()) :: {:ok, String.t()} | {:error, term()}
-  def send_message(session, options) do
-    GenServer.call(session, {:send, options})
+  @spec send_message(session(), map() | keyword(), keyword()) ::
+          {:ok, String.t()} | {:error, term()}
+  def send_message(session, options, opts \\ []) do
+    rpc = rpc(session)
+    params = build_send_params(Map.new(options), rpc.session_id)
+
+    case CopilotSdk.JsonRpc.Client.request(rpc.json_rpc_pid, "session.send", params, opts) do
+      {:ok, result} -> {:ok, result["messageId"] || result["id"]}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @doc """
@@ -93,8 +94,10 @@ defmodule CopilotSdk.Session do
           {:ok, SessionEvent.t() | nil} | {:error, term()}
   def send_and_wait(session, options, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 60_000)
+    deadline = deadline(timeout)
     caller = self()
     ref = make_ref()
+    monitor = Process.monitor(session)
 
     unsubscribe =
       on(session, fn event ->
@@ -114,36 +117,44 @@ defmodule CopilotSdk.Session do
       end)
 
     try do
-      {:ok, _message_id} = send_message(session, options)
-      wait_for_idle(ref, nil, timeout)
+      case send_message(session, options, timeout: remaining(deadline)) do
+        {:ok, _message_id} -> wait_for_idle(ref, monitor, nil, deadline)
+        {:error, reason} -> {:error, reason}
+      end
     after
       unsubscribe.()
+      Process.demonitor(monitor, [:flush])
+      flush_wait_messages(ref)
     end
   end
 
   @doc "Disconnect this session."
   @spec disconnect(session()) :: :ok | {:error, term()}
   def disconnect(session) do
-    GenServer.call(session, :disconnect)
+    GenServer.call(session, :disconnect, :infinity)
   end
 
   @doc "Abort the current operation."
   @spec abort(session()) :: :ok | {:error, term()}
   def abort(session) do
-    GenServer.call(session, :abort)
+    session |> rpc() |> SessionRpc.abort() |> result_to_ok_error()
   end
 
   @doc "Change the model for this session."
   @spec set_model(session(), String.t()) :: :ok | {:error, term()}
   def set_model(session, model) do
-    GenServer.call(session, {:set_model, model})
+    session |> rpc() |> SessionRpc.switch_model(model) |> result_to_ok_error()
   end
 
   @doc "Log a message to the session timeline."
   @spec log(session(), String.t(), keyword()) :: :ok | {:error, term()}
   def log(session, message, opts \\ []) do
-    GenServer.call(session, {:log, message, opts})
+    session |> rpc() |> SessionRpc.log(message, Map.new(opts)) |> result_to_ok_error()
   end
+
+  @doc "Get the persisted events for this session."
+  @spec get_messages(session()) :: {:ok, map()} | {:error, term()}
+  def get_messages(session), do: session |> rpc() |> SessionRpc.get_messages()
 
   @doc "Get workspace path."
   @spec workspace_path(session()) :: String.t() | nil
@@ -181,7 +192,7 @@ defmodule CopilotSdk.Session do
   def init(init_arg) do
     session_id = init_arg.session_id
     json_rpc_pid = init_arg.json_rpc_pid
-    config = init_arg[:config] || %{}
+    config = normalize_config(init_arg[:config] || %{})
 
     {:ok, producer} = EventProducer.start_link([])
     {:ok, consumer_sup} = DynamicSupervisor.start_link(strategy: :one_for_one)
@@ -235,38 +246,11 @@ defmodule CopilotSdk.Session do
     {:reply, {:ok, consumer_pid}, state}
   end
 
-  def handle_call({:send, options}, _from, state) do
-    params = build_send_params(options, state.session_id)
-
-    case CopilotSdk.JsonRpc.Client.request(state.json_rpc_pid, "session.send", params) do
-      {:ok, result} ->
-        message_id = result["messageId"] || result["id"]
-        {:reply, {:ok, message_id}, state}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
-
   def handle_call(:disconnect, _from, state) do
-    result = SessionRpc.destroy(state.rpc)
-    {:reply, result_to_ok_error(result), state}
-  end
-
-  def handle_call(:abort, _from, state) do
-    result = SessionRpc.abort(state.rpc)
-    {:reply, result_to_ok_error(result), state}
-  end
-
-  def handle_call({:set_model, model}, _from, state) do
-    result = SessionRpc.switch_model(state.rpc, model)
-    {:reply, result_to_ok_error(result), state}
-  end
-
-  def handle_call({:log, message, opts}, _from, state) do
-    opts_map = %{level: Keyword.get(opts, :level), ephemeral: Keyword.get(opts, :ephemeral)}
-    result = SessionRpc.log(state.rpc, message, opts_map)
-    {:reply, result_to_ok_error(result), state}
+    case SessionRpc.destroy(state.rpc) do
+      {:ok, _} -> {:stop, :normal, :ok, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:workspace_path, _from, state) do
@@ -304,6 +288,10 @@ defmodule CopilotSdk.Session do
 
   @impl true
   def terminate(_reason, state) do
+    for pid <- [state.consumer_supervisor, state.task_supervisor] do
+      if is_pid(pid) && Process.alive?(pid), do: Supervisor.stop(pid, :normal)
+    end
+
     if state.event_producer_pid && Process.alive?(state.event_producer_pid) do
       GenStage.stop(state.event_producer_pid, :normal)
     end
@@ -312,6 +300,90 @@ defmodule CopilotSdk.Session do
   end
 
   # --- Internal ---
+
+  @doc false
+  def handle_server_request(config, session_id, "hooks.invoke", params) do
+    output =
+      CopilotSdk.SessionHooks.dispatch(
+        config[:hooks],
+        params["hookType"],
+        params["input"],
+        %{session_id: session_id}
+      )
+
+    if is_nil(output), do: %{}, else: %{"output" => output}
+  end
+
+  def handle_server_request(config, session_id, "tool.call", params) do
+    tool = Enum.find(config[:tools] || [], &(&1.name == params["toolName"]))
+    handler = if tool, do: tool.handler
+    %{"result" => execute_tool(handler, session_id, params)}
+  end
+
+  def handle_server_request(config, session_id, "permission.request", params) do
+    request = params["permissionRequest"] || params["request"] || params
+    %{"result" => execute_permission(config[:on_permission_request], session_id, request)}
+  end
+
+  def handle_server_request(config, session_id, "userInput.request", params) do
+    execute_user_input(config[:on_user_input_request], session_id, params)
+  end
+
+  defp execute_tool(handler, session_id, params) do
+    invocation = %ToolInvocation{
+      session_id: session_id,
+      tool_call_id: params["toolCallId"],
+      tool_name: params["toolName"],
+      arguments: params["arguments"]
+    }
+
+    result =
+      if handler do
+        handler.(invocation)
+      else
+        %ToolResult{result_type: :failure, text_result_for_llm: "Unknown tool"}
+      end
+
+    ToolResult.to_wire(result)
+  rescue
+    _ -> failed_tool_result()
+  catch
+    _, _ -> failed_tool_result()
+  end
+
+  defp failed_tool_result do
+    ToolResult.to_wire(%ToolResult{
+      result_type: :failure,
+      text_result_for_llm: "Tool handler failed"
+    })
+  end
+
+  defp execute_permission(handler, session_id, request) do
+    result =
+      if handler,
+        do: handler.(request, %{session_id: session_id}),
+        else: %PermissionRequestResult{}
+
+    PermissionRequestResult.to_wire(result)
+  rescue
+    _ -> PermissionRequestResult.to_wire(%PermissionRequestResult{})
+  catch
+    _, _ -> PermissionRequestResult.to_wire(%PermissionRequestResult{})
+  end
+
+  defp execute_user_input(nil, _session_id, _params),
+    do: raise(ArgumentError, "No user input handler registered")
+
+  defp execute_user_input(handler, session_id, params) do
+    request = %CopilotSdk.UserInputRequest{
+      question: params["question"],
+      choices: params["choices"] || [],
+      allow_freeform: params["allowFreeform"] != false
+    }
+
+    response = handler.(request, %{session_id: session_id})
+    %{"answer" => response.answer, "wasFreeform" => response.was_freeform || false}
+  end
 
   defp handle_broadcast_event(%{type: :external_tool_requested} = event, state) do
     request_id = event.data["requestId"]
@@ -325,19 +397,17 @@ defmodule CopilotSdk.Session do
         rpc = state.rpc
 
         Task.Supervisor.start_child(state.task_supervisor, fn ->
-          invocation = %ToolInvocation{
-            session_id: rpc.session_id,
-            tool_call_id: event.data["toolCallId"],
-            tool_name: tool_name,
-            arguments: event.data["arguments"]
-          }
-
-          result = handler.(invocation)
-          wire_result = ToolResult.to_wire(result)
+          wire_result = execute_tool(handler, rpc.session_id, event.data)
           SessionRpc.handle_tool_result(rpc, request_id, wire_result)
         end)
     end
   end
+
+  defp handle_broadcast_event(
+         %{type: :permission_requested, data: %{"resolvedByHook" => true}},
+         _state
+       ),
+       do: :ok
 
   defp handle_broadcast_event(%{type: :permission_requested} = event, state) do
     case state.permission_handler do
@@ -349,10 +419,8 @@ defmodule CopilotSdk.Session do
         rpc = state.rpc
 
         Task.Supervisor.start_child(state.task_supervisor, fn ->
-          request = event.data
-          invocation = %{session_id: rpc.session_id}
-          result = handler.(request, invocation)
-          wire_result = PermissionRequestResult.to_wire(result)
+          request = event.data["permissionRequest"] || event.data
+          wire_result = execute_permission(handler, rpc.session_id, request)
           SessionRpc.handle_permission_result(rpc, request_id, wire_result)
         end)
     end
@@ -368,20 +436,7 @@ defmodule CopilotSdk.Session do
         rpc = state.rpc
 
         Task.Supervisor.start_child(state.task_supervisor, fn ->
-          request = %CopilotSdk.UserInputRequest{
-            question: event.data["question"],
-            choices: event.data["choices"] || [],
-            allow_freeform: event.data["allowFreeform"] != false
-          }
-
-          invocation = %{session_id: rpc.session_id}
-          response = handler.(request, invocation)
-
-          wire_response = %{
-            "answer" => response.answer,
-            "wasFreeform" => response.was_freeform || false
-          }
-
+          wire_response = execute_user_input(handler, rpc.session_id, event.data)
           SessionRpc.handle_user_input_result(rpc, request_id, wire_response)
         end)
     end
@@ -392,7 +447,10 @@ defmodule CopilotSdk.Session do
   defp build_send_params(options, session_id) when is_map(options) do
     %{"sessionId" => session_id}
     |> maybe_put("prompt", options[:prompt] || options["prompt"])
-    |> maybe_put("attachments", build_attachments(options[:attachments] || options["attachments"]))
+    |> maybe_put(
+      "attachments",
+      build_attachments(options[:attachments] || options["attachments"])
+    )
     |> maybe_put("mode", options[:mode] || options["mode"])
   end
 
@@ -405,19 +463,39 @@ defmodule CopilotSdk.Session do
   defp result_to_ok_error({:ok, _}), do: :ok
   defp result_to_ok_error({:error, reason}), do: {:error, reason}
 
-  defp wait_for_idle(ref, last_message, timeout) do
+  defp normalize_config(%_{} = config), do: Map.from_struct(config)
+  defp normalize_config(config), do: Map.new(config)
+
+  defp deadline(:infinity), do: :infinity
+  defp deadline(timeout), do: System.monotonic_time(:millisecond) + timeout
+  defp remaining(:infinity), do: :infinity
+  defp remaining(deadline), do: max(deadline - System.monotonic_time(:millisecond), 0)
+
+  defp wait_for_idle(ref, monitor, last_message, deadline) do
     receive do
       {^ref, :assistant_message, event} ->
-        wait_for_idle(ref, event, timeout)
+        wait_for_idle(ref, monitor, event, deadline)
 
       {^ref, :idle} ->
         {:ok, last_message}
 
       {^ref, :error, event} ->
         {:error, "Session error: #{inspect(event.data)}"}
+
+      {:DOWN, ^monitor, :process, _pid, reason} ->
+        {:error, {:session_closed, reason}}
     after
-      timeout ->
+      remaining(deadline) ->
         {:error, :timeout}
+    end
+  end
+
+  defp flush_wait_messages(ref) do
+    receive do
+      {^ref, _} -> flush_wait_messages(ref)
+      {^ref, _, _} -> flush_wait_messages(ref)
+    after
+      0 -> :ok
     end
   end
 end
