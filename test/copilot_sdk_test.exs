@@ -10,6 +10,6 @@ defmodule CopilotSdkTest do
   end
 
   test "SDK min protocol version is 2" do
-    assert CopilotSdk.SdkProtocolVersion.min() == 2
+    assert CopilotSdk.SdkProtocolVersion.min() == 3
   end
 end

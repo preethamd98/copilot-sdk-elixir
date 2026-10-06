@@ -19,6 +19,7 @@ defmodule CopilotSdk.JsonRpc.Client do
     :transport,
     :transport_ref,
     :notification_handler,
+    :task_supervisor,
     buffer: "",
     next_id: 1,
     pending: %{},
@@ -53,11 +54,21 @@ defmodule CopilotSdk.JsonRpc.Client do
     {:ok, pid}
   end
 
-  @doc "Send a JSON-RPC request and wait for the response."
+  @doc """
+  Send a JSON-RPC request and wait for the response.
+
+  The `:timeout` option defaults to 30_000 milliseconds and accepts `:infinity`.
+  An expired request returns `{:error, :timeout}`.
+  """
   @spec request(pid(), String.t(), map(), keyword()) :: {:ok, term()} | {:error, term()}
   def request(pid, method, params \\ %{}, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 30_000)
-    GenServer.call(pid, {:request, method, params}, timeout)
+
+    unless timeout == :infinity or (is_integer(timeout) and timeout >= 0) do
+      raise ArgumentError, "timeout must be a non-negative integer or :infinity"
+    end
+
+    GenServer.call(pid, {:request, method, params, timeout}, :infinity)
   end
 
   @doc "Send a JSON-RPC notification (no response expected)."
@@ -98,6 +109,7 @@ defmodule CopilotSdk.JsonRpc.Client do
   def init(opts) do
     transport = Keyword.fetch!(opts, :transport)
     notification_handler = Keyword.get(opts, :notification_handler, fn _m, _p -> :ok end)
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
 
     transport_ref =
       case transport do
@@ -112,7 +124,8 @@ defmodule CopilotSdk.JsonRpc.Client do
     state = %__MODULE__{
       transport: transport,
       transport_ref: transport_ref,
-      notification_handler: notification_handler
+      notification_handler: notification_handler,
+      task_supervisor: task_supervisor
     }
 
     {:ok, state}
@@ -124,7 +137,7 @@ defmodule CopilotSdk.JsonRpc.Client do
     {:reply, :ok, state}
   end
 
-  def handle_call({:request, method, params}, from, state) do
+  def handle_call({:request, method, params, timeout}, from, state) do
     id = "req-#{state.next_id}"
 
     message = %{
@@ -136,7 +149,13 @@ defmodule CopilotSdk.JsonRpc.Client do
 
     case send_message(message, state) do
       :ok ->
-        pending = Map.put(state.pending, id, from)
+        timer =
+          case timeout do
+            :infinity -> nil
+            timeout -> Process.send_after(self(), {:request_timeout, id}, timeout)
+          end
+
+        pending = Map.put(state.pending, id, {from, timer})
         {:noreply, %{state | pending: pending, next_id: state.next_id + 1}}
 
       {:error, reason} ->
@@ -181,21 +200,32 @@ defmodule CopilotSdk.JsonRpc.Client do
   # Handle Port exit
   def handle_info({:DOWN, ref, :port, _port, reason}, %{transport_ref: ref} = state) do
     Logger.warning("JSON-RPC transport port closed: #{inspect(reason)}")
-    fail_all_pending(state, {:error, :transport_closed})
+    state = fail_all_pending(state, {:error, :transport_closed})
     {:stop, {:transport_closed, reason}, state}
   end
 
   # Handle TCP close
   def handle_info({:tcp_closed, socket}, %{transport: {:tcp, socket}} = state) do
     Logger.warning("JSON-RPC TCP connection closed")
-    fail_all_pending(state, {:error, :transport_closed})
+    state = fail_all_pending(state, {:error, :transport_closed})
     {:stop, :transport_closed, state}
   end
 
   def handle_info({:tcp_error, socket, reason}, %{transport: {:tcp, socket}} = state) do
     Logger.warning("JSON-RPC TCP error: #{inspect(reason)}")
-    fail_all_pending(state, {:error, {:tcp_error, reason}})
+    state = fail_all_pending(state, {:error, {:tcp_error, reason}})
     {:stop, {:tcp_error, reason}, state}
+  end
+
+  def handle_info({:request_timeout, id}, state) do
+    case Map.pop(state.pending, id) do
+      {nil, _pending} ->
+        {:noreply, state}
+
+      {{from, _timer}, pending} ->
+        GenServer.reply(from, {:error, :timeout})
+        {:noreply, %{state | pending: pending}}
+    end
   end
 
   def handle_info({:send_response, response}, state) do
@@ -210,7 +240,11 @@ defmodule CopilotSdk.JsonRpc.Client do
   @impl true
   def terminate(_reason, state) do
     fail_all_pending(state, {:error, :shutting_down})
+    close_transport(state.transport)
+    Supervisor.stop(state.task_supervisor, :normal, :infinity)
     :ok
+  catch
+    :exit, _ -> :ok
   end
 
   # --- Internal ---
@@ -246,7 +280,8 @@ defmodule CopilotSdk.JsonRpc.Client do
   defp handle_incoming_message(message, state) do
     cond do
       # Response to a pending request
-      Map.has_key?(message, "id") && (Map.has_key?(message, "result") || Map.has_key?(message, "error")) ->
+      Map.has_key?(message, "id") &&
+          (Map.has_key?(message, "result") || Map.has_key?(message, "error")) ->
         handle_response(message, state)
 
       # Server-to-client request (has id + method)
@@ -271,7 +306,9 @@ defmodule CopilotSdk.JsonRpc.Client do
         Logger.warning("Received response for unknown request ID: #{id}")
         state
 
-      {from, pending} ->
+      {{from, timer}, pending} ->
+        cancel_timer(timer)
+
         result =
           if Map.has_key?(message, "error") do
             error = message["error"]
@@ -306,34 +343,29 @@ defmodule CopilotSdk.JsonRpc.Client do
         # Execute handler asynchronously to avoid blocking the GenServer
         self_pid = self()
 
-        Task.start(fn ->
-          try do
-            result = handler.(params)
-
-            response = %{
-              "jsonrpc" => "2.0",
-              "id" => id,
-              "result" => result || %{}
-            }
-
+        Task.Supervisor.start_child(
+          state.task_supervisor,
+          fn ->
+            response = invoke_handler(handler, params, id)
             send(self_pid, {:send_response, response})
-          rescue
-            e ->
-              response = %{
-                "jsonrpc" => "2.0",
-                "id" => id,
-                "error" => %{
-                  "code" => -32000,
-                  "message" => Exception.message(e)
-                }
-              }
-
-              send(self_pid, {:send_response, response})
-          end
-        end)
+          end,
+          shutdown: :brutal_kill
+        )
 
         state
     end
+  end
+
+  defp invoke_handler(handler, params, id) do
+    %{"jsonrpc" => "2.0", "id" => id, "result" => handler.(params)}
+  rescue
+    exception -> handler_error(id, Exception.message(exception))
+  catch
+    kind, reason -> handler_error(id, Exception.format_banner(kind, reason))
+  end
+
+  defp handler_error(id, message) do
+    %{"jsonrpc" => "2.0", "id" => id, "error" => %{"code" => -32000, "message" => message}}
   end
 
   defp handle_notification(message, state) do
@@ -350,8 +382,22 @@ defmodule CopilotSdk.JsonRpc.Client do
   end
 
   defp fail_all_pending(state, error) do
-    Enum.each(state.pending, fn {_id, from} ->
+    Enum.each(state.pending, fn {_id, {from, timer}} ->
+      cancel_timer(timer)
       GenServer.reply(from, error)
     end)
+
+    %{state | pending: %{}}
+  end
+
+  defp cancel_timer(nil), do: :ok
+  defp cancel_timer(timer), do: Process.cancel_timer(timer)
+
+  defp close_transport({:tcp, socket}), do: :gen_tcp.close(socket)
+
+  defp close_transport({:port, port}) do
+    Port.close(port)
+  rescue
+    ArgumentError -> :ok
   end
 end

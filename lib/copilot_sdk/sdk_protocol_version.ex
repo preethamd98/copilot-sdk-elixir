@@ -1,7 +1,7 @@
 defmodule CopilotSdk.SdkProtocolVersion do
   @moduledoc "SDK protocol version constants."
 
-  @min_protocol_version 2
+  @min_protocol_version 3
   @sdk_protocol_version 3
 
   @doc "Returns the current SDK protocol version (max supported)."

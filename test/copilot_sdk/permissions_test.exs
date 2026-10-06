@@ -8,9 +8,30 @@ defmodule CopilotSdk.PermissionsTest do
     assert result.kind == :approved
   end
 
+  test "approve_all abstains when managed settings are enabled" do
+    result =
+      PermissionHandler.approve_all(%{}, %{session_id: "s1", managed_settings_enabled: true})
+
+    assert result.kind == :no_result
+    assert PermissionRequestResult.to_wire(result) == %{"kind" => "no-result"}
+  end
+
+  test "approve_all preserves the public approved alias when managed settings are disabled" do
+    result =
+      PermissionHandler.approve_all(%{}, %{session_id: "s1", managed_settings_enabled: false})
+
+    assert result.kind == :approved
+    assert PermissionRequestResult.to_wire(result) == %{"kind" => "approve-once"}
+  end
+
   test "wire format conversion for all permission kinds" do
     kinds = [
-      {:approved, "approved"},
+      {:approved, "approve-once"},
+      {:approve_once, "approve-once"},
+      {:deny, "reject"},
+      {:reject, "reject"},
+      {:user_not_available, "user-not-available"},
+      {:no_result, "no-result"},
       {:denied_by_rules, "denied-by-rules"},
       {:denied_by_content_exclusion_policy, "denied-by-content-exclusion-policy"},
       {:denied_could_not_request_from_user,
@@ -31,7 +52,7 @@ defmodule CopilotSdk.PermissionsTest do
     }
 
     wire = PermissionRequestResult.to_wire(result)
-    assert wire["kind"] == "approved"
+    assert wire["kind"] == "approve-once"
     assert wire["feedback"] == "Looks good"
     assert wire["message"] == "Approved by policy"
     refute Map.has_key?(wire, "rules")

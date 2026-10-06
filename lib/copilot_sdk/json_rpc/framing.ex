@@ -5,6 +5,8 @@ defmodule CopilotSdk.JsonRpc.Framing do
   Parses and encodes messages with `Content-Length: N\\r\\n\\r\\n{json}` framing.
   """
 
+  require Logger
+
   @doc """
   Encode a JSON-RPC message map into a Content-Length framed binary.
   """
@@ -38,15 +40,20 @@ defmodule CopilotSdk.JsonRpc.Framing do
 
       :incomplete ->
         {Enum.reverse(acc), buffer}
+
+      {:error, reason, rest} ->
+        Logger.warning("Discarding invalid JSON-RPC frame: #{reason}")
+        parse_loop(rest, acc)
     end
   end
 
   @doc """
   Extract a single Content-Length framed message from the buffer.
 
-  Returns `{:ok, message, rest}` or `:incomplete`.
+  Returns `{:ok, message, rest}`, `{:error, reason, rest}`, or `:incomplete`.
   """
-  @spec extract_one(binary()) :: {:ok, map(), binary()} | :incomplete
+  @spec extract_one(binary()) ::
+          {:ok, map(), binary()} | {:error, atom(), binary()} | :incomplete
   def extract_one(buffer) do
     case parse_header(buffer) do
       {:ok, content_length, body_start} ->
@@ -54,8 +61,9 @@ defmodule CopilotSdk.JsonRpc.Framing do
           <<json_bytes::binary-size(content_length), rest::binary>> = body_start
 
           case Jason.decode(json_bytes) do
-            {:ok, message} -> {:ok, message, rest}
-            {:error, _} -> :incomplete
+            {:ok, message} when is_map(message) -> {:ok, message, rest}
+            {:ok, _} -> {:error, :invalid_message, rest}
+            {:error, _} -> {:error, :invalid_json, rest}
           end
         else
           :incomplete
@@ -74,7 +82,7 @@ defmodule CopilotSdk.JsonRpc.Framing do
 
         case parse_content_length(header_part) do
           {:ok, length} -> {:ok, length, body_start}
-          :error -> :incomplete
+          :error -> raise ArgumentError, "Invalid JSON-RPC Content-Length header"
         end
 
       :nomatch ->

@@ -22,6 +22,30 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
     - `:on_request` - Optional function `fn(method, params) -> response` for custom handling
   """
   def start(opts \\ []) do
+    {:ok, listener} = start_listener(opts)
+
+    {:ok, client_socket} =
+      :gen_tcp.connect(~c"127.0.0.1", listener.port, [:binary, active: false], 5000)
+
+    server_pid = listener.server_pid
+
+    server_socket =
+      receive do
+        {:server_socket, ^server_pid, socket} -> socket
+      after
+        5000 -> raise "Mock server didn't report its socket"
+      end
+
+    {:ok,
+     Map.merge(listener, %{
+       transport: {:tcp, client_socket},
+       socket: client_socket,
+       server_socket: server_socket
+     })}
+  end
+
+  @doc "Start a TCP mock for exercising the SDK client's real connection path."
+  def start_listener(opts \\ []) do
     protocol_version = Keyword.get(opts, :protocol_version, 3)
     on_request = Keyword.get(opts, :on_request)
     test_pid = self()
@@ -38,22 +62,10 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
         mock_server_loop(accept_socket, protocol_version, on_request, test_pid, "")
       end)
 
-    {:ok, client_socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 5000)
-
-    # Wait for the server to tell us its socket
-    server_socket =
-      receive do
-        {:server_socket, ^server_pid, socket} -> socket
-      after
-        5000 -> raise "Mock server didn't report its socket"
-      end
-
     {:ok,
      %{
        server_pid: server_pid,
-       transport: {:tcp, client_socket},
-       socket: client_socket,
-       server_socket: server_socket,
+       port: port,
        listen_socket: listen
      }}
   end
@@ -68,8 +80,17 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
         {messages, remaining} = Framing.parse(buffer)
 
         Enum.each(messages, fn msg ->
-          send(test_pid, {:mock_rpc_call, msg["method"], msg["params"]})
-          response = build_response(msg, protocol_version, on_request)
+          send(test_pid, {:mock_rpc_message, msg})
+
+          if Map.has_key?(msg, "method") do
+            send(test_pid, {:mock_rpc_call, msg["method"], msg["params"]})
+          else
+            send(test_pid, {:mock_rpc_response, msg})
+          end
+
+          response =
+            if Map.has_key?(msg, "method"),
+              do: build_response(msg, protocol_version, on_request)
 
           if response do
             {:ok, frame} = Framing.encode(response)
@@ -81,6 +102,11 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
 
       {:tcp_closed, ^socket} ->
         :ok
+
+      {:send_message, message} ->
+        {:ok, frame} = Framing.encode(message)
+        :gen_tcp.send(socket, frame)
+        mock_server_loop(socket, protocol_version, on_request, test_pid, buffer)
 
       {:send_notification, method, params} ->
         message = %{
@@ -118,11 +144,11 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
           default_response(method, params, protocol_version)
         end
 
-      %{
-        "jsonrpc" => "2.0",
-        "id" => id,
-        "result" => result
-      }
+      case result do
+        :no_reply -> nil
+        {:error, error} -> %{"jsonrpc" => "2.0", "id" => id, "error" => error}
+        _ -> %{"jsonrpc" => "2.0", "id" => id, "result" => result}
+      end
     end
   end
 
@@ -135,6 +161,9 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
       "protocolVersion" => protocol_version
     }
   end
+
+  defp default_response("connect", _params, protocol_version),
+    do: %{"protocolVersion" => protocol_version}
 
   defp default_response("session.create", params, _pv) do
     %{
@@ -151,6 +180,8 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
   end
 
   defp default_response("session.destroy", _params, _pv), do: %{}
+  defp default_response("session.detach", _params, _pv), do: %{"success" => true}
+  defp default_response("session.delete", _params, _pv), do: %{"success" => true}
 
   defp default_response("session.abort", _params, _pv), do: %{}
 
@@ -167,7 +198,7 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
 
   defp default_response("session.getMessages", _params, _pv), do: %{"messages" => []}
 
-  defp default_response("getAuthStatus", _params, _pv) do
+  defp default_response("auth.getStatus", _params, _pv) do
     %{"authenticated" => true, "user" => "test-user"}
   end
 
@@ -175,14 +206,14 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
     %{"models" => [%{"name" => "gpt-4", "id" => "gpt-4"}]}
   end
 
-  defp default_response("sessions.list", _params, _pv), do: %{"sessions" => []}
+  defp default_response("session.list", _params, _pv), do: %{"sessions" => []}
 
-  defp default_response("sessions.getLastSessionId", _params, _pv), do: %{"sessionId" => nil}
+  defp default_response("session.getLastId", _params, _pv), do: %{"sessionId" => nil}
 
-  defp default_response("sessions.getForegroundSessionId", _params, _pv),
+  defp default_response("session.getForeground", _params, _pv),
     do: %{"sessionId" => nil}
 
-  defp default_response("sessions.setForegroundSessionId", _params, _pv), do: %{}
+  defp default_response("session.setForeground", _params, _pv), do: %{}
 
   defp default_response("session.tools.handlePendingToolCall", _params, _pv), do: %{}
 
@@ -239,7 +270,8 @@ defmodule CopilotSdk.Test.Helpers do
         notification_handler: fn _method, _params -> :ok end
       )
 
-    session_id = Keyword.get(opts, :session_id, "test-session-#{System.unique_integer([:positive])}")
+    session_id =
+      Keyword.get(opts, :session_id, "test-session-#{System.unique_integer([:positive])}")
 
     config =
       Keyword.get(opts, :config, %{})

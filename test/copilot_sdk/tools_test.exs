@@ -137,10 +137,11 @@ defmodule CopilotSdk.ToolsTest do
       wire = Tools.to_wire(tool)
       assert wire["name"] == "get_weather"
       assert wire["description"] == "Get weather"
-      assert wire["inputSchema"] == %{"type" => "object"}
+      assert wire["parameters"] == %{"type" => "object"}
+      refute Map.has_key?(wire, "inputSchema")
     end
 
-    test "omits inputSchema when no parameters" do
+    test "omits parameters when no parameters" do
       tool =
         Tools.define_tool(
           name: "no_params",
@@ -150,7 +151,7 @@ defmodule CopilotSdk.ToolsTest do
 
       wire = Tools.to_wire(tool)
       assert wire["name"] == "no_params"
-      refute Map.has_key?(wire, "inputSchema")
+      refute Map.has_key?(wire, "parameters")
     end
   end
 end
