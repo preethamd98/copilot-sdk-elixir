@@ -13,6 +13,9 @@ defmodule CopilotSdk.Tools do
     * `:parameters` - Optional. JSON Schema for tool parameters.
     * `:handler` - Required. Function with arity 1 (args) or 2 (args, invocation).
     * `:overrides_built_in_tool` - Optional boolean (default: false).
+    * `:defer` - Optional `"auto"` or `"never"` tool-loading policy.
+    * `:metadata` - Optional opaque host-defined metadata.
+    * `:is_terminal` - Optional boolean; a successful call ends the agent turn.
 
   ## Examples
 
@@ -44,23 +47,21 @@ defmodule CopilotSdk.Tools do
       description: description,
       parameters: parameters,
       handler: wrap_handler(handler),
-      overrides_built_in_tool: overrides_built_in
+      overrides_built_in_tool: overrides_built_in,
+      defer: Keyword.get(opts, :defer),
+      metadata: Keyword.get(opts, :metadata),
+      is_terminal: Keyword.get(opts, :is_terminal)
     }
   end
 
   @doc "Convert a Tool to the wire format map for session.create payload."
   def to_wire(%Tool{} = tool) do
-    wire = %{
-      "name" => tool.name,
-      "description" => tool.description
-    }
-
     wire =
-      if tool.parameters do
-        Map.put(wire, "inputSchema", tool.parameters)
-      else
-        wire
-      end
+      %{"name" => tool.name, "description" => tool.description}
+      |> maybe_put("parameters", tool.parameters)
+      |> maybe_put("defer", tool.defer)
+      |> maybe_put("metadata", tool.metadata)
+      |> maybe_put("isTerminal", tool.is_terminal)
 
     if tool.overrides_built_in_tool do
       Map.put(wire, "overridesBuiltInTool", true)
@@ -68,6 +69,9 @@ defmodule CopilotSdk.Tools do
       wire
     end
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp wrap_handler(handler) when is_function(handler, 2) do
     fn %ToolInvocation{} = invocation ->

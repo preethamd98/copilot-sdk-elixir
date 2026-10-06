@@ -40,7 +40,8 @@ defmodule CopilotSdk.Session do
     :user_input_handler,
     :hooks,
     :rpc,
-    :on_event
+    :on_event,
+    managed_settings_enabled: false
   ]
 
   # --- Public API ---
@@ -101,14 +102,20 @@ defmodule CopilotSdk.Session do
 
     unsubscribe =
       on(session, fn event ->
-        case event.type do
-          :assistant_message ->
+        case event do
+          %{agent_id: agent_id} when agent_id not in [nil, ""] ->
+            :ok
+
+          %{type: :assistant_message} ->
             send(caller, {ref, :assistant_message, event})
 
-          :session_idle ->
+          %{type: :session_idle, data: %{"mode" => "autopilot"}} ->
+            :ok
+
+          %{type: :session_idle} ->
             send(caller, {ref, :idle})
 
-          :session_error ->
+          %{type: :session_error} ->
             send(caller, {ref, :error, event})
 
           _ ->
@@ -141,9 +148,25 @@ defmodule CopilotSdk.Session do
   end
 
   @doc "Change the model for this session."
-  @spec set_model(session(), String.t()) :: :ok | {:error, term()}
-  def set_model(session, model) do
-    session |> rpc() |> SessionRpc.switch_model(model) |> result_to_ok_error()
+  @spec set_model(session(), String.t(), map() | keyword()) :: :ok | {:error, term()}
+  def set_model(session, model, opts \\ %{}) do
+    opts = Map.new(opts)
+    rpc = rpc(session)
+
+    wire_opts =
+      opts
+      |> CopilotSdk.WireFormat.build_session_payload(rpc.session_id)
+      |> Map.take(["reasoningEffort", "reasoningSummary", "contextTier", "modelCapabilities"])
+
+    wire_opts =
+      if Map.get(opts, :reasoning_effort, :absent) == nil or
+           Map.get(opts, "reasoningEffort", :absent) == nil do
+        Map.put(wire_opts, "reasoningEffort", nil)
+      else
+        wire_opts
+      end
+
+    rpc |> SessionRpc.switch_model(model, wire_opts) |> result_to_ok_error()
   end
 
   @doc "Log a message to the session timeline."
@@ -220,7 +243,8 @@ defmodule CopilotSdk.Session do
       user_input_handler: config[:on_user_input_request] || config["on_user_input_request"],
       hooks: config[:hooks] || config["hooks"],
       rpc: session_rpc,
-      on_event: config[:on_event] || config["on_event"]
+      on_event: config[:on_event] || config["on_event"],
+      managed_settings_enabled: managed_settings_enabled?(config)
     }
 
     # If there's an early-bind on_event handler, subscribe it immediately
@@ -247,9 +271,15 @@ defmodule CopilotSdk.Session do
   end
 
   def handle_call(:disconnect, _from, state) do
-    case SessionRpc.destroy(state.rpc) do
-      {:ok, _} -> {:stop, :normal, :ok, state}
-      {:error, reason} -> {:reply, {:error, reason}, state}
+    case SessionRpc.detach(state.rpc) do
+      {:ok, %{"success" => false} = response} ->
+        {:reply, {:error, response["error"] || :disconnect_failed}, state}
+
+      {:ok, _} ->
+        {:stop, :normal, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
     end
   end
 
@@ -322,7 +352,16 @@ defmodule CopilotSdk.Session do
 
   def handle_server_request(config, session_id, "permission.request", params) do
     request = params["permissionRequest"] || params["request"] || params
-    %{"result" => execute_permission(config[:on_permission_request], session_id, request)}
+
+    %{
+      "result" =>
+        execute_permission(
+          config[:on_permission_request],
+          session_id,
+          request,
+          managed_settings_enabled?(config)
+        )
+    }
   end
 
   def handle_server_request(config, session_id, "userInput.request", params) do
@@ -358,17 +397,21 @@ defmodule CopilotSdk.Session do
     })
   end
 
-  defp execute_permission(handler, session_id, request) do
+  defp execute_permission(handler, session_id, request, managed_settings_enabled) do
     result =
       if handler,
-        do: handler.(request, %{session_id: session_id}),
-        else: %PermissionRequestResult{}
+        do:
+          handler.(request, %{
+            session_id: session_id,
+            managed_settings_enabled: managed_settings_enabled
+          }),
+        else: %PermissionRequestResult{kind: :user_not_available}
 
     PermissionRequestResult.to_wire(result)
   rescue
-    _ -> PermissionRequestResult.to_wire(%PermissionRequestResult{})
+    _ -> PermissionRequestResult.to_wire(%PermissionRequestResult{kind: :user_not_available})
   catch
-    _, _ -> PermissionRequestResult.to_wire(%PermissionRequestResult{})
+    _, _ -> PermissionRequestResult.to_wire(%PermissionRequestResult{kind: :user_not_available})
   end
 
   defp execute_user_input(nil, _session_id, _params),
@@ -420,8 +463,13 @@ defmodule CopilotSdk.Session do
 
         Task.Supervisor.start_child(state.task_supervisor, fn ->
           request = event.data["permissionRequest"] || event.data
-          wire_result = execute_permission(handler, rpc.session_id, request)
-          SessionRpc.handle_permission_result(rpc, request_id, wire_result)
+
+          wire_result =
+            execute_permission(handler, rpc.session_id, request, state.managed_settings_enabled)
+
+          if wire_result["kind"] != "no-result" do
+            SessionRpc.handle_permission_result(rpc, request_id, wire_result)
+          end
         end)
     end
   end
@@ -452,6 +500,20 @@ defmodule CopilotSdk.Session do
       build_attachments(options[:attachments] || options["attachments"])
     )
     |> maybe_put("mode", options[:mode] || options["mode"])
+    |> maybe_put("source", options[:source] || options["source"])
+    |> maybe_put("displayPrompt", options[:display_prompt] || options["displayPrompt"])
+    |> maybe_put("agentMode", options[:agent_mode] || options["agentMode"])
+    |> maybe_put("requestHeaders", options[:request_headers] || options["requestHeaders"])
+    |> maybe_put("responseFormat", response_format(options[:response_schema]))
+  end
+
+  defp response_format(nil), do: nil
+
+  defp response_format(schema) when is_map(schema) do
+    %{
+      "type" => "json_schema",
+      "jsonSchema" => %{"name" => "response", "strict" => true, "schema" => schema}
+    }
   end
 
   defp build_attachments(nil), do: nil
@@ -465,6 +527,10 @@ defmodule CopilotSdk.Session do
 
   defp normalize_config(%_{} = config), do: Map.from_struct(config)
   defp normalize_config(config), do: Map.new(config)
+
+  defp managed_settings_enabled?(config) do
+    config[:enable_managed_settings] == true or not is_nil(config[:managed_settings])
+  end
 
   defp deadline(:infinity), do: :infinity
   defp deadline(timeout), do: System.monotonic_time(:millisecond) + timeout

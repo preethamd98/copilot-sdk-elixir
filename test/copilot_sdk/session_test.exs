@@ -120,10 +120,11 @@ defmodule CopilotSdk.SessionTest do
   end
 
   describe "disconnect/1" do
-    test "sends session.destroy RPC" do
+    test "sends session.detach RPC" do
       {:ok, session, _mock} = start_test_session()
       result = CopilotSdk.Session.disconnect(session)
       assert result == :ok
+      assert_receive {:mock_rpc_call, "session.detach", %{"sessionId" => _}}
     end
   end
 

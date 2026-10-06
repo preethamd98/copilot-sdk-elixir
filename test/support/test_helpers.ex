@@ -162,6 +162,9 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
     }
   end
 
+  defp default_response("connect", _params, protocol_version),
+    do: %{"protocolVersion" => protocol_version}
+
   defp default_response("session.create", params, _pv) do
     %{
       "sessionId" => params["sessionId"],
@@ -177,6 +180,8 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
   end
 
   defp default_response("session.destroy", _params, _pv), do: %{}
+  defp default_response("session.detach", _params, _pv), do: %{"success" => true}
+  defp default_response("session.delete", _params, _pv), do: %{"success" => true}
 
   defp default_response("session.abort", _params, _pv), do: %{}
 
@@ -193,7 +198,7 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
 
   defp default_response("session.getMessages", _params, _pv), do: %{"messages" => []}
 
-  defp default_response("getAuthStatus", _params, _pv) do
+  defp default_response("auth.getStatus", _params, _pv) do
     %{"authenticated" => true, "user" => "test-user"}
   end
 
@@ -201,14 +206,14 @@ defmodule CopilotSdk.Test.MockJsonRpcServer do
     %{"models" => [%{"name" => "gpt-4", "id" => "gpt-4"}]}
   end
 
-  defp default_response("sessions.list", _params, _pv), do: %{"sessions" => []}
+  defp default_response("session.list", _params, _pv), do: %{"sessions" => []}
 
-  defp default_response("sessions.getLastSessionId", _params, _pv), do: %{"sessionId" => nil}
+  defp default_response("session.getLastId", _params, _pv), do: %{"sessionId" => nil}
 
-  defp default_response("sessions.getForegroundSessionId", _params, _pv),
+  defp default_response("session.getForeground", _params, _pv),
     do: %{"sessionId" => nil}
 
-  defp default_response("sessions.setForegroundSessionId", _params, _pv), do: %{}
+  defp default_response("session.setForeground", _params, _pv), do: %{}
 
   defp default_response("session.tools.handlePendingToolCall", _params, _pv), do: %{}
 

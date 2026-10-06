@@ -7,16 +7,20 @@ defmodule CopilotSdk.SessionEvent do
           id: String.t() | nil,
           timestamp: String.t() | nil,
           ephemeral: boolean() | nil,
+          agent_id: String.t() | nil,
+          wire_type: String.t() | nil,
           parent_id: String.t() | nil
         }
 
-  defstruct [:type, :id, :timestamp, :ephemeral, :parent_id, data: %{}]
+  defstruct [:type, :id, :timestamp, :ephemeral, :parent_id, :agent_id, :wire_type, data: %{}]
 
   @doc "Parse a raw event map (from JSON-RPC notification params) into a SessionEvent."
   @spec from_map(map()) :: t()
   def from_map(event_map) when is_map(event_map) do
     %__MODULE__{
       type: CopilotSdk.Generated.SessionEventType.from_string(event_map["type"] || ""),
+      wire_type: event_map["type"],
+      agent_id: event_map["agentId"],
       data: event_map["data"] || %{},
       id: event_map["id"],
       timestamp: event_map["timestamp"],

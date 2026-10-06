@@ -75,7 +75,7 @@ defmodule CopilotSdk.SessionReliabilityTest do
     assert session_id == info.session_id
 
     assert_receive {:mock_rpc_call, "session.permissions.handlePendingPermissionRequest",
-                    %{"result" => %{"kind" => "approved"}}},
+                    %{"result" => %{"kind" => "approve-once"}}},
                    1000
   end
 
@@ -86,7 +86,7 @@ defmodule CopilotSdk.SessionReliabilityTest do
     assert_receive {:mock_rpc_call, "session.permissions.handlePendingPermissionRequest",
                     %{
                       "result" => %{
-                        "kind" => "denied-no-approval-rule-and-could-not-request-from-user"
+                        "kind" => "user-not-available"
                       }
                     }},
                    1000
@@ -125,7 +125,7 @@ defmodule CopilotSdk.SessionReliabilityTest do
                "arguments" => %{"text" => "hello"}
              })
 
-    assert %{"result" => %{"kind" => "approved"}} =
+    assert %{"result" => %{"kind" => "approve-once"}} =
              Session.handle_server_request(config, "s", "permission.request", %{})
 
     assert %{"answer" => "yes", "wasFreeform" => false} =
@@ -149,7 +149,78 @@ defmodule CopilotSdk.SessionReliabilityTest do
     assert %{"result" => %{"resultType" => "failure"}} =
              Session.handle_server_request(%{}, "s", "tool.call", %{"toolName" => "missing"})
 
-    assert %{"result" => %{"kind" => "denied-no-approval-rule-and-could-not-request-from-user"}} =
+    assert %{"result" => %{"kind" => "user-not-available"}} =
              Session.handle_server_request(%{}, "s", "permission.request", %{})
+  end
+
+  test "send_and_wait ignores subagent messages and autopilot idle events" do
+    {:ok, session, _} = start_test_session()
+    task = Task.async(fn -> Session.send_and_wait(session, %{prompt: "hello"}, timeout: 2000) end)
+    assert_receive {:mock_rpc_call, "session.send", _}, 1000
+
+    Session.dispatch_event(session, Map.put(assistant_message_event("child"), "agentId", "child"))
+    Session.dispatch_event(session, Map.put(idle_event(), "agentId", "child"))
+    Session.dispatch_event(session, put_in(idle_event(), ["data", "mode"], "autopilot"))
+    Session.dispatch_event(session, assistant_message_event("root"))
+    Session.dispatch_event(session, idle_event())
+    assert {:ok, %{data: %{"content" => "root"}, agent_id: nil}} = Task.await(task)
+  end
+
+  test "message metadata and response schemas are sent with upstream names" do
+    {:ok, session, _} = start_test_session()
+    schema = %{"type" => "object", "properties" => %{"raw_key" => %{"type" => "string"}}}
+
+    assert {:ok, _} =
+             Session.send_message(session,
+               prompt: "hello",
+               source: "app",
+               display_prompt: "display",
+               agent_mode: "plan",
+               response_schema: schema,
+               request_headers: %{"x-custom-header" => "value"}
+             )
+
+    assert_receive {:mock_rpc_call, "session.send",
+                    %{
+                      "source" => "app",
+                      "displayPrompt" => "display",
+                      "agentMode" => "plan",
+                      "requestHeaders" => %{"x-custom-header" => "value"},
+                      "responseFormat" => %{
+                        "type" => "json_schema",
+                        "jsonSchema" => %{
+                          "name" => "response",
+                          "strict" => true,
+                          "schema" => ^schema
+                        }
+                      }
+                    }}
+  end
+
+  test "managed approve_all abstains rather than bypassing policy" do
+    assert %{kind: :no_result} =
+             CopilotSdk.PermissionHandler.approve_all(%{}, %{managed_settings_enabled: true})
+  end
+
+  test "model switching normalizes Elixir options and supports clearing reasoning effort" do
+    {:ok, session, _} = start_test_session()
+
+    assert :ok =
+             Session.set_model(session, "test-model",
+               reasoning_effort: "high",
+               context_tier: "long_context"
+             )
+
+    assert_receive {:mock_rpc_call, "session.model.switchTo",
+                    %{
+                      "modelId" => "test-model",
+                      "reasoningEffort" => "high",
+                      "contextTier" => "long_context"
+                    }}
+
+    assert :ok = Session.set_model(session, "test-model", reasoning_effort: nil)
+
+    assert_receive {:mock_rpc_call, "session.model.switchTo",
+                    %{"modelId" => "test-model", "reasoningEffort" => nil}}
   end
 end

@@ -3,6 +3,79 @@ defmodule CopilotSdk.ToolsUnitTest do
 
   alias CopilotSdk.{Tools, ToolInvocation, ToolResult}
 
+  describe "tool declarations" do
+    test "parameters use the upstream key and preserve arbitrary schema property names" do
+      schema = %{
+        "type" => "object",
+        "properties" => %{
+          "working_directory" => %{"type" => "string"},
+          "input_schema" => %{"type" => "object", "additionalProperties" => false}
+        },
+        "required" => ["working_directory"]
+      }
+
+      tool =
+        Tools.define_tool(
+          name: "my_tool",
+          description: "Tool",
+          parameters: schema,
+          handler: fn _ -> "ok" end
+        )
+
+      wire = Tools.to_wire(tool)
+      assert wire["parameters"] == schema
+      refute Map.has_key?(wire, "inputSchema")
+      refute Map.has_key?(wire, "handler")
+    end
+
+    test "optional metadata, defer and terminal fields reach the wire unchanged" do
+      metadata = %{"host:custom_key" => %{"keep_snake_case" => false}}
+
+      tool =
+        Tools.define_tool(
+          name: "finish",
+          description: "Finish the turn",
+          handler: fn _ -> "done" end,
+          defer: "never",
+          metadata: metadata,
+          is_terminal: true
+        )
+
+      assert tool.defer == "never"
+      assert tool.metadata == metadata
+      assert tool.is_terminal == true
+
+      assert Tools.to_wire(tool) == %{
+               "name" => "finish",
+               "description" => "Finish the turn",
+               "defer" => "never",
+               "metadata" => metadata,
+               "isTerminal" => true
+             }
+    end
+
+    test "optional fields preserve false and empty maps, and are omitted when unset" do
+      tool =
+        Tools.define_tool(
+          name: "tool",
+          description: "Tool",
+          handler: fn _ -> "ok" end,
+          parameters: %{},
+          metadata: %{},
+          defer: "auto",
+          is_terminal: false
+        )
+
+      assert Tools.to_wire(tool)["parameters"] == %{}
+      assert Tools.to_wire(tool)["metadata"] == %{}
+      assert Tools.to_wire(tool)["defer"] == "auto"
+      assert Tools.to_wire(tool)["isTerminal"] == false
+
+      default = Tools.define_tool(name: "tool", description: "Tool", handler: fn _ -> "ok" end)
+      assert Tools.to_wire(default) == %{"name" => "tool", "description" => "Tool"}
+    end
+  end
+
   describe "overrides_built_in_tool in wire format" do
     test "to_wire includes overridesBuiltInTool when true" do
       tool =
@@ -106,8 +179,7 @@ defmodule CopilotSdk.ToolsUnitTest do
     end
 
     test "list normalizes to JSON-serialized success" do
-      tool =
-        Tools.define_tool(name: "t", description: "d", handler: fn _, _ -> [1, 2, 3] end)
+      tool = Tools.define_tool(name: "t", description: "d", handler: fn _, _ -> [1, 2, 3] end)
 
       result = tool.handler.(%ToolInvocation{arguments: %{}})
       assert result.result_type == :success

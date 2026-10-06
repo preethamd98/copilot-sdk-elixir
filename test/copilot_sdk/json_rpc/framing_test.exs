@@ -74,6 +74,24 @@ defmodule CopilotSdk.JsonRpc.FramingTest do
       assert rest == ""
     end
 
+    test "discards complete invalid frames and continues with the next message" do
+      {:ok, valid} = Framing.encode(%{"id" => "1", "result" => "ok"})
+
+      assert {[%{"id" => "1", "result" => "ok"}], ""} =
+               Framing.parse("Content-Length: 1\r\n\r\n!" <> valid)
+    end
+
+    test "non-object JSON is rejected without crashing the message dispatcher" do
+      assert {:error, :invalid_message, ""} =
+               Framing.extract_one("Content-Length: 4\r\n\r\nnull")
+    end
+
+    test "invalid headers fail instead of buffering forever" do
+      assert_raise ArgumentError, ~r/Content-Length/, fn ->
+        Framing.parse("Content-Length: -1\r\n\r\n")
+      end
+    end
+
     test "handles message followed by partial message" do
       msg1 = Jason.encode!(%{"id" => "1", "result" => "complete"})
       msg2_json = Jason.encode!(%{"id" => "2", "result" => "incomplete"})

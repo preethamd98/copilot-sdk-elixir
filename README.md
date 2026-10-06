@@ -37,7 +37,7 @@ mix deps.get
 ### Prerequisites
 
 - **Elixir** ≥ 1.15
-- **Node.js** ≥ 16 (for the bundled Copilot CLI server)
+- **Node.js** — a version supported by your installed Copilot CLI
 - **Copilot CLI server binary** — install via the Node.js SDK package:
 
 ```bash
@@ -52,8 +52,24 @@ The SDK automatically discovers the CLI binary using this precedence:
 2. **Environment variable** — `COPILOT_CLI_PATH`
 3. **Auto-discovery** — walks up from the SDK directory looking for
    `nodejs/node_modules/@github/copilot/index.js` (sibling directory layout)
+4. **PATH** — an installed `copilot` executable
 
 If none are found, a clear error is raised.
+
+### Runtime compatibility
+
+The current wire contract targets
+[`github/copilot-sdk@6f67591`](https://github.com/github/copilot-sdk/tree/6f67591aea97825b61bd866130f3ab6e96688f07)
+(October 6, 2026). Protocol **3** is required. Older CLIs can report the same
+protocol number while using different permission or session lifecycle APIs;
+compatibility with every older protocol-3 CLI is **not** guaranteed.
+
+The client uses `connect` for negotiation. Legacy `ping` fallback is allowed only
+when `connect` is unsupported and no connection token was supplied.
+For an external TCP runtime, pass `use_stdio: false`, `cli_url: "tcp://host:port"`,
+and, when required, `connection_token: token`. SDK-launched TCP runtimes receive
+an automatically generated token through the environment. TCP is not TLS:
+use loopback or a separately secured transport, not an untrusted network.
 
 ## Quick Start
 
@@ -138,11 +154,76 @@ tool = CopilotSdk.Tools.define_tool(
 | `CopilotSdk.WireFormat` | Snake_case ↔ camelCase conversion |
 | `CopilotSdk.JsonRpc.Framing` | Content-Length framed JSON-RPC encoding |
 | `CopilotSdk.Generated.SessionEventType` | 59 session event type mappings |
+| `CopilotSdk.Generated.ServerRpc` | Status, authentication, models, tools, quota, and session discovery |
+| `CopilotSdk.Generated.SessionRpc` | Model, mode, plan, agent, skill, and compaction APIs |
+
+### Added upstream capabilities
+
+Session creation accepts maps, keyword lists, or `%CopilotSdk.SessionConfig{}`.
+New options cover model capabilities, reasoning summaries, context tiers,
+configuration discovery, additional directories, custom agent models,
+session limits, telemetry/citations/file-change tracking, disabled MCP servers,
+and plugin/instruction directories. Explicit `false` values are preserved.
+Provider and MCP options normalize known fields without rewriting arbitrary
+schema properties, headers, server names, or metadata keys.
+Resume also accepts `suppress_resume_event`, `continue_pending_work`, and
+`allow_transcript_recovery`; these are not sent when creating a new session.
+
+Hooks and user-input callbacks are routed before creation/resumption completes,
+so runtime callbacks during session startup do not deadlock. Extended hooks
+include pre-MCP calls, failed tool calls, transformed prompts, agent stop,
+and subagent start/stop. Permission callbacks receive the nested permission
+request. `:approved` remains an Elixir alias for the current `"approve-once"`
+wire decision; handler failures deny permission. `PermissionHandler.approve_all/2`
+abstains when managed settings are enabled instead of bypassing policy.
+
+`Session.send_message/3` supports `source`, `display_prompt`, `agent_mode`,
+`request_headers`, and `response_schema`. The schema is sent as the runtime's
+JSON Schema response format; this SDK does **not** perform local schema validation.
+`send_and_wait/3` uses one timeout budget including submission, ignores child-agent
+and autopilot-continuation idle events, and returns send failures as error tuples.
+A timeout does not abort runtime work; use `Session.abort/1` when desired.
+
+```elixir
+alias CopilotSdk.{Client, Session}
+alias CopilotSdk.Generated.SessionRpc
+
+{:ok, status} = Client.get_status(client)
+{:ok, quota} = Client.get_quota(client)
+{:ok, tools} = Client.list_tools(client)
+
+:ok = Session.set_model(session, "your-model", reasoning_effort: "high")
+{:ok, messages} = Session.get_messages(session)
+
+rpc = Session.rpc(session)
+{:ok, model} = SessionRpc.get_current_model(rpc)
+{:ok, mode} = SessionRpc.get_mode(rpc)
+{:ok, plan} = SessionRpc.read_plan(rpc)
+{:ok, agents} = SessionRpc.list_agents(rpc)
+{:ok, skills} = SessionRpc.list_skills(rpc)
+```
+
+Low-level generated RPC wrappers return raw `{:ok, wire_map}` / `{:error, reason}`
+results and accept camelCase string-keyed option maps where documented. They also
+expose mode changes, plan updates/deletion, agent selection, and history compaction.
+`SessionRpc.set_tools/2` changes server declarations only; it does **not** replace
+local callback handlers.
+
+`Session.disconnect/1` calls `session.detach`, preserves persisted history, and
+stops the local session and its children. `Client.delete_session/2` permanently
+deletes a session by ID, including one not currently loaded in this client.
+Disconnecting invalidates the session PID; resume it to obtain a new PID.
+
+This is a bounded compatibility update, **not full upstream parity**. Session FS,
+binary/SQLite filesystem providers, dynamic local tool replacement, skill providers,
+cloud/join sessions, cancellation-aware external tools, and newer experimental
+callbacks remain unsupported. Live-CLI compatibility has not been verified for this
+update.
 
 ## Running Tests
 
 ```bash
-# Unit tests (109 tests, no CLI required)
+# Unit tests (no CLI required)
 mix test
 
 # E2E tests (requires a real CLI — 27 additional tests)
@@ -158,4 +239,3 @@ mix quality
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-

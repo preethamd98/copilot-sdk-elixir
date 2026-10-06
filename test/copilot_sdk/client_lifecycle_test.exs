@@ -35,7 +35,21 @@ defmodule CopilotSdk.ClientLifecycleTest do
 
   test "resume accepts keyword options and duplicate sessions do not leak processes" do
     {client, _mock} = start_client()
-    assert {:ok, session} = Client.resume_session(client, "existing", model: "test")
+
+    assert {:ok, session} =
+             Client.resume_session(client, "existing",
+               model: "test",
+               suppress_resume_event: true,
+               continue_pending_work: false
+             )
+
+    assert_receive {:mock_rpc_call, "session.resume",
+                    %{
+                      "sessionId" => "existing",
+                      "disableResume" => true,
+                      "continuePendingWork" => false
+                    }}
+
     assert Session.session_id(session) == "existing"
 
     assert {:error, :session_already_connected} =
@@ -155,5 +169,72 @@ defmodule CopilotSdk.ClientLifecycleTest do
 
     assert {:ok, %{"models" => [%{"id" => "custom"}]}} = Client.list_models(client)
     GenServer.stop(client)
+  end
+
+  test "connect authentication errors do not fall back to ping" do
+    {:ok, mock} =
+      MockJsonRpcServer.start_listener(
+        on_request: fn
+          "connect", _ -> {:error, %{"code" => -32001, "message" => "unauthorized"}}
+          _, _ -> nil
+        end
+      )
+
+    {:ok, client} =
+      Client.start_link(
+        auto_start: false,
+        use_stdio: false,
+        cli_url: "tcp://127.0.0.1:#{mock.port}",
+        connection_token: "test-connection-token"
+      )
+
+    assert {:error, {:handshake_failed, %{message: "unauthorized"}}} = Client.start(client)
+    assert_receive {:mock_rpc_call, "connect", %{"token" => "test-connection-token"}}
+    refute_receive {:mock_rpc_call, "ping", _}
+    GenServer.stop(client)
+  end
+
+  test "connect falls back to ping only for legacy servers without a configured token" do
+    {client, _mock} =
+      start_client(
+        on_request: fn
+          "connect", _ -> {:error, %{"code" => -32601, "message" => "Method not found"}}
+          _, _ -> nil
+        end
+      )
+
+    assert Client.get_state(client) == :connected
+    assert_receive {:mock_rpc_call, "connect", %{}}
+    assert_receive {:mock_rpc_call, "ping", %{}}
+  end
+
+  test "delete handles server-level failure without discarding the session" do
+    {client, _mock} =
+      start_client(
+        on_request: fn
+          "session.delete", _ -> %{"success" => false, "error" => "busy"}
+          _, _ -> nil
+        end
+      )
+
+    {:ok, session} = Client.create_session(client, session_id: "busy")
+    assert {:error, "busy"} = Client.delete_session(client, "busy")
+    assert Process.alive?(session)
+  end
+
+  test "unexpected session IDs clean up preregistered callbacks and processes" do
+    {client, _mock} =
+      start_client(
+        on_request: fn
+          "session.create", _ -> %{"sessionId" => "unexpected"}
+          _, _ -> nil
+        end
+      )
+
+    assert {:error, :invalid_session_id} = Client.create_session(client, session_id: "requested")
+    state = :sys.get_state(client)
+    assert state.sessions == %{}
+    assert :ets.tab2list(state.session_registry) == []
+    assert DynamicSupervisor.which_children(state.session_supervisor) == []
   end
 end

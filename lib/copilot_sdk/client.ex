@@ -69,7 +69,7 @@ defmodule CopilotSdk.Client do
   @doc "Stop the client gracefully."
   @spec stop(client()) :: :ok
   def stop(client) do
-    GenServer.call(client, :stop, 15_000)
+    GenServer.call(client, :stop, :infinity)
   catch
     :exit, _ -> :ok
   end
@@ -77,7 +77,7 @@ defmodule CopilotSdk.Client do
   @doc "Force stop the client."
   @spec force_stop(client()) :: :ok
   def force_stop(client) do
-    GenServer.call(client, :force_stop, 10_000)
+    GenServer.call(client, :force_stop, :infinity)
   catch
     :exit, _ -> :ok
   end
@@ -103,7 +103,7 @@ defmodule CopilotSdk.Client do
   @doc "Ping the server."
   @spec ping(client(), String.t() | nil) :: {:ok, map()} | {:error, term()}
   def ping(client, message \\ nil) do
-    GenServer.call(client, {:ping, message})
+    GenServer.call(client, {:ping, message}, :infinity)
   end
 
   @doc "Get the current client state."
@@ -115,38 +115,50 @@ defmodule CopilotSdk.Client do
   @doc "Get authentication status."
   @spec get_auth_status(client()) :: {:ok, map()} | {:error, term()}
   def get_auth_status(client) do
-    GenServer.call(client, :get_auth_status)
+    GenServer.call(client, :get_auth_status, :infinity)
   end
 
   @doc "List available models."
   @spec list_models(client()) :: {:ok, map()} | {:error, term()}
   def list_models(client) do
-    GenServer.call(client, :list_models)
+    GenServer.call(client, :list_models, :infinity)
   end
 
   @doc "List sessions."
   @spec list_sessions(client(), map() | nil) :: {:ok, map()} | {:error, term()}
   def list_sessions(client, filter \\ nil) do
-    GenServer.call(client, {:list_sessions, filter})
+    GenServer.call(client, {:list_sessions, filter}, :infinity)
   end
 
   @doc "Get the last session ID."
   @spec get_last_session_id(client()) :: {:ok, map()} | {:error, term()}
   def get_last_session_id(client) do
-    GenServer.call(client, :get_last_session_id)
+    GenServer.call(client, :get_last_session_id, :infinity)
   end
 
   @doc "Get the foreground session ID."
   @spec get_foreground_session_id(client()) :: {:ok, map()} | {:error, term()}
   def get_foreground_session_id(client) do
-    GenServer.call(client, :get_foreground_session_id)
+    GenServer.call(client, :get_foreground_session_id, :infinity)
   end
 
   @doc "Set the foreground session ID."
   @spec set_foreground_session_id(client(), String.t()) :: {:ok, map()} | {:error, term()}
   def set_foreground_session_id(client, session_id) do
-    GenServer.call(client, {:set_foreground_session_id, session_id})
+    GenServer.call(client, {:set_foreground_session_id, session_id}, :infinity)
   end
+
+  @doc "Get CLI version and protocol status."
+  @spec get_status(client()) :: {:ok, map()} | {:error, term()}
+  def get_status(client), do: server_request(client, &ServerRpc.get_status/1)
+
+  @doc "Get account quota information."
+  @spec get_quota(client()) :: {:ok, map()} | {:error, term()}
+  def get_quota(client), do: server_request(client, &ServerRpc.get_quota/1)
+
+  @doc "List tools available from the runtime."
+  @spec list_tools(client()) :: {:ok, map()} | {:error, term()}
+  def list_tools(client), do: server_request(client, &ServerRpc.list_tools/1)
 
   @doc "Get the ServerRpc accessor."
   @spec rpc(client()) :: CopilotSdk.Generated.ServerRpc.t() | nil
@@ -176,6 +188,14 @@ defmodule CopilotSdk.Client do
   def init(opts) do
     Process.flag(:trap_exit, true)
     options = ClientOptions.new(opts)
+
+    options =
+      if not options.use_stdio and is_nil(options.cli_url) do
+        %{options | connection_token: options.connection_token || generate_uuid()}
+      else
+        options
+      end
+
     {:ok, session_sup} = DynamicSupervisor.start_link(strategy: :one_for_one)
     {:ok, task_sup} = Task.Supervisor.start_link()
 
@@ -217,32 +237,32 @@ defmodule CopilotSdk.Client do
       send(state.json_rpc, {:send_response, response})
     end
 
-    def handle_info({:EXIT, pid, _reason}, %{json_rpc: pid} = state) do
-      {:noreply, do_force_stop(state)}
-    end
-
-    def handle_info({:EXIT, pid, reason}, state)
-        when pid == state.session_supervisor or pid == state.task_supervisor do
-      {:stop, reason, state}
-    end
-
-    def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
-
-    def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-      sessions =
-        Map.reject(state.sessions, fn {session_id, session_pid} ->
-          if session_pid == pid do
-            :ets.delete(state.session_registry, session_id)
-            true
-          else
-            false
-          end
-        end)
-
-      {:noreply, %{state | sessions: sessions}}
-    end
-
     {:noreply, state}
+  end
+
+  def handle_info({:EXIT, pid, _reason}, %{json_rpc: pid} = state) do
+    {:noreply, do_force_stop(state)}
+  end
+
+  def handle_info({:EXIT, pid, reason}, state)
+      when pid == state.session_supervisor or pid == state.task_supervisor do
+    {:stop, reason, state}
+  end
+
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
+    sessions =
+      Map.reject(state.sessions, fn {session_id, session_pid} ->
+        if session_pid == pid do
+          :ets.delete(state.session_registry, session_id)
+          true
+        else
+          false
+        end
+      end)
+
+    {:noreply, %{state | sessions: sessions}}
   end
 
   def handle_info({:notification, "session.event", params}, state) do
@@ -551,7 +571,7 @@ defmodule CopilotSdk.Client do
   end
 
   defp verify_protocol_version(state) do
-    case JsonRpc.Client.request(state.json_rpc, "ping", %{}, timeout: 10_000) do
+    case connect_handshake(state) do
       {:ok, response} ->
         server_version = response["protocolVersion"]
         min_version = CopilotSdk.SdkProtocolVersion.min()
@@ -570,7 +590,23 @@ defmodule CopilotSdk.Client do
         end
 
       {:error, reason} ->
-        {:error, {:ping_failed, reason}}
+        {:error, {:handshake_failed, reason}}
+    end
+  end
+
+  defp connect_handshake(state) do
+    token = state.options.connection_token
+    params = if token, do: %{"token" => token}, else: %{}
+
+    case JsonRpc.Client.request(state.json_rpc, "connect", params, timeout: 10_000) do
+      {:error, %{code: -32601}} when is_nil(token) ->
+        JsonRpc.Client.request(state.json_rpc, "ping", %{}, timeout: 10_000)
+
+      {:error, %{message: "Unhandled method connect"}} when is_nil(token) ->
+        JsonRpc.Client.request(state.json_rpc, "ping", %{}, timeout: 10_000)
+
+      result ->
+        result
     end
   end
 
@@ -598,10 +634,15 @@ defmodule CopilotSdk.Client do
         :ets.insert(state.session_registry, {session_id, config})
 
         case JsonRpc.Client.request(state.json_rpc, "session.create", payload) do
-          {:ok, response} ->
+          {:ok, %{"sessionId" => ^session_id} = response} ->
             Session.set_workspace_path(session_pid, response["workspacePath"])
             dispatch_lifecycle(state, :session_created, %{session_id: session_id})
             {:ok, session_pid, state}
+
+          {:ok, _response} ->
+            :ets.delete(state.session_registry, session_id)
+            DynamicSupervisor.terminate_child(state.session_supervisor, session_pid)
+            {:error, :invalid_session_id}
 
           {:error, reason} ->
             :ets.delete(state.session_registry, session_id)
@@ -622,7 +663,7 @@ defmodule CopilotSdk.Client do
 
       true ->
         config = Map.put(config, :session_id, session_id)
-        payload = WireFormat.build_session_payload(config, session_id)
+        payload = WireFormat.build_resume_payload(config, session_id)
 
         {:ok, session_pid} =
           DynamicSupervisor.start_child(
@@ -636,9 +677,14 @@ defmodule CopilotSdk.Client do
         :ets.insert(state.session_registry, {session_id, config})
 
         case JsonRpc.Client.request(state.json_rpc, "session.resume", payload) do
-          {:ok, response} ->
+          {:ok, %{"sessionId" => ^session_id} = response} ->
             Session.set_workspace_path(session_pid, response["workspacePath"])
             {:ok, session_pid, state}
+
+          {:ok, _response} ->
+            :ets.delete(state.session_registry, session_id)
+            DynamicSupervisor.terminate_child(state.session_supervisor, session_pid)
+            {:error, :invalid_session_id}
 
           {:error, reason} ->
             :ets.delete(state.session_registry, session_id)
@@ -652,6 +698,9 @@ defmodule CopilotSdk.Client do
   defp do_delete_session(session_id, state) do
     if state.json_rpc do
       case JsonRpc.Client.request(state.json_rpc, "session.delete", %{"sessionId" => session_id}) do
+        {:ok, %{"success" => false} = response} ->
+          {:error, response["error"] || :delete_failed}
+
         {:ok, _} ->
           if session_pid = Map.get(state.sessions, session_id) do
             DynamicSupervisor.terminate_child(state.session_supervisor, session_pid)
@@ -697,29 +746,6 @@ defmodule CopilotSdk.Client do
       JsonRpc.Client.stop(state.json_rpc)
     end
 
-    defp stop_supervisor(pid) do
-      if Process.alive?(pid), do: Supervisor.stop(pid, :normal)
-    end
-
-    defp normalize_config(%_{} = config), do: Map.from_struct(config)
-    defp normalize_config(config), do: Map.new(config)
-
-    defp register_request_handlers(json_rpc, registry) do
-      for method <- ["tool.call", "permission.request", "userInput.request", "hooks.invoke"] do
-        JsonRpc.Client.set_request_handler(json_rpc, method, fn params ->
-          session_id = params["sessionId"]
-
-          case :ets.lookup(registry, session_id) do
-            [{^session_id, config}] ->
-              Session.handle_server_request(config, session_id, method, params)
-
-            [] ->
-              raise ArgumentError, "Unknown session"
-          end
-        end)
-      end
-    end
-
     # Close TCP socket
     if state.socket do
       :gen_tcp.close(state.socket)
@@ -746,6 +772,36 @@ defmodule CopilotSdk.Client do
     }
   end
 
+  defp stop_supervisor(pid) do
+    if Process.alive?(pid), do: Supervisor.stop(pid, :normal)
+  end
+
+  defp normalize_config(%_{} = config), do: Map.from_struct(config)
+  defp normalize_config(config), do: Map.new(config)
+
+  defp server_request(client, callback) do
+    case rpc(client) do
+      nil -> {:error, :not_connected}
+      rpc -> callback.(rpc)
+    end
+  end
+
+  defp register_request_handlers(json_rpc, registry) do
+    for method <- ["tool.call", "permission.request", "userInput.request", "hooks.invoke"] do
+      JsonRpc.Client.set_request_handler(json_rpc, method, fn params ->
+        session_id = params["sessionId"]
+
+        case :ets.lookup(registry, session_id) do
+          [{^session_id, config}] ->
+            Session.handle_server_request(config, session_id, method, params)
+
+          [] ->
+            raise ArgumentError, "Unknown session"
+        end
+      end)
+    end
+  end
+
   defp notification_handler(client_pid) do
     fn method, params ->
       send(client_pid, {:notification, method, params})
@@ -754,11 +810,13 @@ defmodule CopilotSdk.Client do
 
   defp dispatch_lifecycle(state, event_type, data) do
     Enum.each(state.lifecycle_handlers, fn {_ref, handler} ->
-      try do
-        handler.(%{type: event_type, data: data})
-      rescue
-        e -> Logger.warning("Lifecycle handler error: #{inspect(e)}")
-      end
+      Task.Supervisor.start_child(state.task_supervisor, fn ->
+        try do
+          handler.(%{type: event_type, data: data})
+        rescue
+          e -> Logger.warning("Lifecycle handler error: #{inspect(e)}")
+        end
+      end)
     end)
   end
 
@@ -849,6 +907,13 @@ defmodule CopilotSdk.Client do
 
   defp build_env(options) do
     base_env = options.env || %{}
+
+    base_env =
+      if options.connection_token do
+        Map.put(base_env, "COPILOT_CONNECTION_TOKEN", options.connection_token)
+      else
+        base_env
+      end
 
     env =
       if options.github_token do

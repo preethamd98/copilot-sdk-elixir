@@ -30,6 +30,7 @@ defmodule CopilotSdk.SessionEventTest do
       })
 
     assert event.type == :unknown
+    assert event.wire_type == "future.unknown_event"
     assert event.data == %{}
   end
 
@@ -69,5 +70,11 @@ defmodule CopilotSdk.SessionEventTest do
       })
 
     assert event.parent_id == "evt-4"
+  end
+
+  test "from_map preserves subagent identity" do
+    event = SessionEvent.from_map(%{"type" => "session.idle", "agentId" => "child-agent"})
+    assert event.agent_id == "child-agent"
+    assert event.wire_type == "session.idle"
   end
 end
