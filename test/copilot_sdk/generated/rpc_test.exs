@@ -166,8 +166,14 @@ defmodule CopilotSdk.Generated.RpcTest do
   end
 
   test "every wrapper returns RPC errors unchanged without retrying or falling back" do
-    error = %{"code" => -32601, "message" => "Method not found", "data" => %{"detail" => "test"}}
-    {client, _mock} = Helpers.start_test_client(on_request: fn _, _ -> {:error, error} end)
+    wire_error = %{
+      "code" => -32601,
+      "message" => "Method not found",
+      "data" => %{"detail" => "test"}
+    }
+
+    expected_error = %{code: -32601, message: "Method not found", data: %{"detail" => "test"}}
+    {client, _mock} = Helpers.start_test_client(on_request: fn _, _ -> {:error, wire_error} end)
     on_exit(fn -> Client.stop(client) end)
 
     for {module, rpc, contracts} <- [
@@ -175,7 +181,7 @@ defmodule CopilotSdk.Generated.RpcTest do
           {SessionRpc, SessionRpc.new(client, "bound-session"), @session_contracts}
         ],
         {function, args, method, params} <- contracts do
-      assert {:error, error} == apply(module, function, [rpc | args])
+      assert {:error, expected_error} == apply(module, function, [rpc | args])
 
       expected =
         if module == SessionRpc, do: Map.put(params, "sessionId", "bound-session"), else: params

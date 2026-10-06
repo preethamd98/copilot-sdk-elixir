@@ -237,4 +237,42 @@ defmodule CopilotSdk.ClientLifecycleTest do
     assert :ets.tab2list(state.session_registry) == []
     assert DynamicSupervisor.which_children(state.session_supervisor) == []
   end
+
+  test "string-keyed callback config is normalized before registration" do
+    {client, mock} = start_client()
+
+    config = %{
+      "sessionId" => "string-config",
+      "onUserInputRequest" => fn request, _ ->
+        %CopilotSdk.UserInputResponse{answer: request.question}
+      end,
+      "hooks" => %{"onPreToolUse" => fn _, _ -> %{"permissionDecision" => "deny"} end}
+    }
+
+    assert {:ok, session} = Client.create_session(client, config)
+    assert Session.session_id(session) == "string-config"
+
+    assert_receive {:mock_rpc_call, "session.create",
+                    %{"sessionId" => "string-config", "requestUserInput" => true, "hooks" => true}}
+
+    for {id, method, params, expected} <- [
+          {"input", "userInput.request", %{"question" => "hello"},
+           %{"answer" => "hello", "wasFreeform" => false}},
+          {"hook", "hooks.invoke", %{"hookType" => "preToolUse", "input" => %{}},
+           %{"output" => %{"permissionDecision" => "deny"}}}
+        ] do
+      send(
+        mock.server_pid,
+        {:send_message,
+         %{
+           "jsonrpc" => "2.0",
+           "id" => id,
+           "method" => method,
+           "params" => Map.put(params, "sessionId", "string-config")
+         }}
+      )
+
+      assert_receive {:mock_rpc_response, %{"id" => ^id, "result" => ^expected}}, 1000
+    end
+  end
 end

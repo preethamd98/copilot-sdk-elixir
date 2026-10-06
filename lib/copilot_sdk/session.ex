@@ -332,7 +332,11 @@ defmodule CopilotSdk.Session do
   # --- Internal ---
 
   @doc false
-  def handle_server_request(config, session_id, "hooks.invoke", params) do
+  def handle_server_request(config, session_id, method, params) do
+    dispatch_server_request(normalize_config(config), session_id, method, params)
+  end
+
+  defp dispatch_server_request(config, session_id, "hooks.invoke", params) do
     output =
       CopilotSdk.SessionHooks.dispatch(
         config[:hooks],
@@ -344,13 +348,13 @@ defmodule CopilotSdk.Session do
     if is_nil(output), do: %{}, else: %{"output" => output}
   end
 
-  def handle_server_request(config, session_id, "tool.call", params) do
+  defp dispatch_server_request(config, session_id, "tool.call", params) do
     tool = Enum.find(config[:tools] || [], &(&1.name == params["toolName"]))
     handler = if tool, do: tool.handler
     %{"result" => execute_tool(handler, session_id, params)}
   end
 
-  def handle_server_request(config, session_id, "permission.request", params) do
+  defp dispatch_server_request(config, session_id, "permission.request", params) do
     request = params["permissionRequest"] || params["request"] || params
 
     %{
@@ -364,7 +368,7 @@ defmodule CopilotSdk.Session do
     }
   end
 
-  def handle_server_request(config, session_id, "userInput.request", params) do
+  defp dispatch_server_request(config, session_id, "userInput.request", params) do
     execute_user_input(config[:on_user_input_request], session_id, params)
   end
 
@@ -525,8 +529,46 @@ defmodule CopilotSdk.Session do
   defp result_to_ok_error({:ok, _}), do: :ok
   defp result_to_ok_error({:error, reason}), do: {:error, reason}
 
-  defp normalize_config(%_{} = config), do: Map.from_struct(config)
-  defp normalize_config(config), do: Map.new(config)
+  @doc false
+  def normalize_config(config) do
+    config = normalize_keys(config, CopilotSdk.SessionConfig)
+
+    case config[:hooks] do
+      nil ->
+        config
+
+      hooks ->
+        hooks = struct(CopilotSdk.SessionHooks, normalize_keys(hooks, CopilotSdk.SessionHooks))
+        Map.put(config, :hooks, hooks)
+    end
+  end
+
+  defp normalize_keys(config, module) do
+    config = if is_struct(config), do: Map.from_struct(config), else: Map.new(config)
+
+    module.__struct__()
+    |> Map.keys()
+    |> Enum.reject(&(&1 == :__struct__))
+    |> Enum.reduce(config, fn key, normalized ->
+      snake_key = Atom.to_string(key)
+      [first | rest] = String.split(snake_key, "_")
+      wire_key = first <> Enum.map_join(rest, &String.capitalize/1)
+
+      cond do
+        Map.has_key?(normalized, key) ->
+          normalized
+
+        Map.has_key?(normalized, snake_key) ->
+          Map.put(normalized, key, normalized[snake_key])
+
+        Map.has_key?(normalized, wire_key) ->
+          Map.put(normalized, key, normalized[wire_key])
+
+        true ->
+          normalized
+      end
+    end)
+  end
 
   defp managed_settings_enabled?(config) do
     config[:enable_managed_settings] == true or not is_nil(config[:managed_settings])

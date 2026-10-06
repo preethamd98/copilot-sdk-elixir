@@ -776,8 +776,7 @@ defmodule CopilotSdk.Client do
     if Process.alive?(pid), do: Supervisor.stop(pid, :normal)
   end
 
-  defp normalize_config(%_{} = config), do: Map.from_struct(config)
-  defp normalize_config(config), do: Map.new(config)
+  defp normalize_config(config), do: Session.normalize_config(config)
 
   defp server_request(client, callback) do
     case rpc(client) do
